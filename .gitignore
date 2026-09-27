@@ -1,0 +1,24 @@
+# 构建产物目录：exe，以及程序运行时在 exe 旁边生成的
+# config.json / logs/ / xime-clip-sync.ui 也都在这里，一整个目录不入库。
+build/
+
+# 构建期生成的 Windows 资源对象（由 genico.go 从 img/logo.ico 生成）。
+# 它必须留在源码根才能被 go build 自动链接，所以单独忽略。
+rsrc_windows_*.syso
+
+# 直接在源码目录跑 exe 时产生的运行期数据。
+# config.json 里有 WebDAV 账号和（DPAPI 加密后的）密码，绝对不要提交。
+config.json
+config.json.tmp
+logs/
+xime-clip-sync.lock
+# 记录当前配置界面地址（端口是随机分配的，第二个实例靠它找到已有实例）
+xime-clip-sync.ui
+
+# 改名（ximeclip → xime-clip-sync）之前留下的运行期文件，
+# 可能还躺在老工作目录里，一并挡住。
+ximeclip.lock
+ximeclip.ui
+
+# img/logo.ico 是图标源文件，必须入库
+!img/logo.ico
