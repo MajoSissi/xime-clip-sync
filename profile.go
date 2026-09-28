@@ -22,21 +22,17 @@ type Profile struct {
 	Source   *string `json:"source"`
 }
 
-// hash 模式：远端 JSON 的 hash 字段如何填写。
-const (
-	// HashModeSHA256：本地按 text 的 SHA-256 计算并写入。
-	HashModeSHA256 = "sha256"
-	// HashModeEmpty：留空，交由对端宿主自行计算（插件注释中记录的约定）。
-	HashModeEmpty = "empty"
-)
-
 // newTextProfile 构造一个纯文本剪贴板 Profile。
 //
 // size 与插件一致，取 text 的 UTF-8 字节长度
 // （对应 TS 的 new TextEncoder().encode(text).length）。
-func newTextProfile(text, source, hashMode string) Profile {
+//
+// hash 固定按本地 SHA-256 计算——这是插件端认的算法，且同步判重用的是
+// **文本内容**而不是 hash，所以没有做成可配置项，界面上也不出现。
+func newTextProfile(text, source string) Profile {
 	p := Profile{
 		Type:    "text",
+		Hash:    hashText(text),
 		Text:    text,
 		HasData: false,
 		Size:    len(text),
@@ -44,11 +40,6 @@ func newTextProfile(text, source, hashMode string) Profile {
 	if source != "" {
 		s := source
 		p.Source = &s
-	}
-	if hashMode == HashModeEmpty {
-		p.Hash = ""
-	} else {
-		p.Hash = hashText(text)
 	}
 	return p
 }

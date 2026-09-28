@@ -15,7 +15,7 @@ const (
 	pullBackoff = 10 * time.Minute
 	pushBackoff = 3 * time.Minute
 
-	// 界面上「本地已同步内容」和「远端内容」两块最多展示这么多字符，
+	// 界面上「本地内容」和「远端内容」两块最多展示这么多字符，
 	// 超出的截断并补省略号。150 是「够看清内容是什么、又不至于把卡片撑成一大块」的长度。
 	previewLen = 150
 	// 远端原始内容在界面上最多展示这么多字符（只在解析失败、退化成原文时才用到）
@@ -92,6 +92,9 @@ type SyncEngine struct {
 	pullCount    int
 	skipCount    int
 	oversize     int
+	// 上一次因超长被跳过的文本。只用于「同一条超长内容只告警一次」——
+	// 超长内容**不写进 current**（理由见 checkLocal 里的说明）。
+	oversizeText string
 
 	wake chan struct{}
 }
@@ -186,8 +189,8 @@ func shortHash(h string) string {
 // noteHash 对比远端 hash 与本地 SHA-256。
 //
 // 这只是兼容性诊断：同步判重用的是**文本内容**，不依赖 hash，
-// 所以两端算法不同也不会出错。但如果对端确实用了别的算法，
-// 提前告知用户，便于把 hash 模式切成「留空」。
+// 所以对端用自己的算法时同步照常工作，这里只记一条 warn。
+// 本地写出去的 hash 固定是 SHA-256，没有开关可改。
 func (e *SyncEngine) noteHash(prof Profile) {
 	if prof.Text == "" {
 		return
@@ -211,8 +214,7 @@ func (e *SyncEngine) noteHash(prof Profile) {
 	e.mu.Unlock()
 
 	if first {
-		e.log.Warnf("对端 hash 与本地 SHA-256 不一致（远端 %s / 本地 %s）。"+
-			"不影响同步（判重用文本内容），但如需严格一致可在配置里把 hash 模式改为「留空」",
+		e.log.Warnf("对端 hash 与本地 SHA-256 不一致（远端 %s / 本地 %s），不影响同步",
 			shortHash(prof.Hash), shortHash(local))
 	}
 }
@@ -329,18 +331,29 @@ func (e *SyncEngine) pollInterval() time.Duration {
 func (e *SyncEngine) localInterval() time.Duration {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return time.Duration(e.cfg.LocalPollMillis) * time.Millisecond
+	return time.Duration(e.cfg.LocalPollSeconds) * time.Second
 }
 
 // prime 建立启动基线：以本地剪贴板为 current，
 // 再拉一次远端——远端有内容则远端优先，远端不存在则用本地播种。
 func (e *SyncEngine) prime() {
+	cfg := e.Config()
 	if text, err := e.clip.GetText(); err == nil {
-		e.mu.Lock()
-		e.current = text
-		e.mu.Unlock()
-		if text != "" {
-			e.log.Infof("启动基线：本地 %d 字符", runeCount(text))
+		// 超长的剪贴板内容同样不当作基线（理由见 checkLocal）：
+		// 它不会被推送，就不该出现在界面的「本地内容」里。
+		if n := runeCount(text); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
+			e.mu.Lock()
+			e.oversizeText = text
+			e.oversize++
+			e.mu.Unlock()
+			e.log.Warnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
+		} else {
+			e.mu.Lock()
+			e.current = text
+			e.mu.Unlock()
+			if text != "" {
+				e.log.Infof("启动基线：本地 %d 字符", runeCount(text))
+			}
 		}
 	} else {
 		e.log.Warnf("读取剪贴板失败：%v", err)
@@ -410,13 +423,21 @@ func (e *SyncEngine) checkLocal(cfg Config) {
 		return
 	}
 	if n := runeCount(*local); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
-		// 记为「已一致」，避免每个检查周期都重复告警刷屏；
-		// 同时计一次数，让界面能告诉用户「有多少次因为太长被跳过了」。
+		// 超长内容**不写进 current**。current 的语义是「本地与远端一致的那份内容」，
+		// 界面上「本地内容」直接显示它，所以把它换成一份从未推送成功的内容会同时造成：
+		//   ① 界面上显示出一段其实没同步过去的内容；
+		//   ② 下一轮远端轮询发现 remote != current，会把远端内容写回剪贴板，
+		//      把用户刚复制的这段长文本冲掉。
+		// 「同一条只告警一次」由下面的 oversizeText 兜底
+		// （正常情况下剪贴板序号没变就不会重复读到）。
 		e.mu.Lock()
-		e.current = *local
-		e.oversize++
+		first := e.oversizeText != *local
+		e.oversizeText = *local
+		e.oversize++ // 让界面能告诉用户「有多少次因为太长被跳过了」
 		e.mu.Unlock()
-		e.log.Warnf("本地 %d 字符超上限 %d，未推送", n, cfg.MaxTextChars)
+		if first {
+			e.log.Warnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
+		}
 		return
 	}
 	e.pushRemote(cfg, *local)
@@ -447,7 +468,7 @@ func (e *SyncEngine) readLocalIfChanged() (*string, error) {
 
 // pushRemote 把文本推送到远端。
 func (e *SyncEngine) pushRemote(cfg Config, text string) bool {
-	payload, err := newTextProfile(text, cfg.DeviceName, cfg.HashMode).encode()
+	payload, err := newTextProfile(text, cfg.DeviceName).encode()
 	if err != nil {
 		e.setError(err)
 		return false
@@ -591,6 +612,10 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 // ---------------------------------------------------------------- 手动操作
 
 // PushNow 立即把当前剪贴板推送到远端。
+//
+// 这是**手动**推送（托盘菜单与界面右上角的「推送」按钮共用它），所以长度上限用
+// ManualMaxTextChars 而不是 MaxTextChars——手动触发是用户的明确意图，允许突破
+// 自动同步的上限。两个上限互不影响：自动同步仍然只看 MaxTextChars。
 func (e *SyncEngine) PushNow() error {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
@@ -606,8 +631,8 @@ func (e *SyncEngine) PushNow() error {
 	if text == "" {
 		return errors.New("本地剪贴板没有文本内容")
 	}
-	if n := runeCount(text); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
-		return fmt.Errorf("本地 %d 字符超上限 %d，未推送", n, cfg.MaxTextChars)
+	if n := runeCount(text); cfg.ManualMaxTextChars > 0 && n > cfg.ManualMaxTextChars {
+		return fmt.Errorf("本地 %d 字符超手动推送上限 %d，未推送", n, cfg.ManualMaxTextChars)
 	}
 	if !e.pushRemote(cfg, text) {
 		e.mu.Lock()

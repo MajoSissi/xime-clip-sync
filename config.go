@@ -40,15 +40,17 @@ type Config struct {
 	Autostart bool `json:"autostart"`
 	// 远端轮询间隔（秒）
 	PollSeconds int `json:"pollSeconds"`
-	// 本地剪贴板检查间隔（毫秒）
-	LocalPollMillis int `json:"localPollMillis"`
+	// 本地剪贴板检查间隔（秒）
+	LocalPollSeconds int `json:"localPollSeconds"`
 	// 局域网自签证书时放宽 TLS 校验
 	InsecureSkipVerify bool `json:"insecureSkipVerify"`
-	// hash 模式：sha256 或 empty
-	HashMode string `json:"hashMode"`
-	// 文本长度上限（字符）。本地复制的内容超过这个长度就不推送到远端；
+	// 自动推送文本长度上限（字符）。本地复制的内容超过这个长度就**自动同步**不推送到远端；
 	// 0 表示不限制。用字符而不是字节，是因为用户看到的是「多少字」。
 	MaxTextChars int `json:"maxTextChars"`
+	// 手动推送的长度上限（字符）。托盘和界面上的「推送」按钮用它，而不是 MaxTextChars——
+	// 手动触发是用户的明确意图，允许突破自动同步的上限（偶尔确实要把一段长文本强推过去）；
+	// 0 表示不限制。
+	ManualMaxTextChars int `json:"manualMaxTextChars"`
 	// 是否把日志写入 logs/ 目录（无控制台构建下排查问题的唯一途径）
 	LogToFile bool `json:"logToFile"`
 	// 日志保留天数（含今天）；0 表示永久保留、不自动清理
@@ -125,17 +127,20 @@ func defaultConfig() Config {
 		host = "desktop"
 	}
 	return Config{
-		RemotePath:      DefaultRemotePath,
-		DeviceName:      host,
-		Enabled:         true,
-		PollSeconds:     30,
-		LocalPollMillis: 1000,
-		HashMode:        HashModeSHA256,
-		MaxTextChars:    300, // 出厂默认；0 = 不限制，用户可在「同步行为」里改
-		LogToFile:       true,
-		LogRetainDays:   7,
-		LogMaxFileMB:    defaultLogFileMB,
-		UIPort:          defaultUIPort,
+		RemotePath:       DefaultRemotePath,
+		DeviceName:       host,
+		Enabled:          true,
+		PollSeconds:      30,
+		LocalPollSeconds: 5,
+		MaxTextChars:     300, // 出厂默认；0 = 不限制，用户可在「同步行为」里改
+		// 手动推送（托盘/界面的「推送」按钮）默认放宽到 10000 字符：
+		// 比自动同步的 300 宽得多，能应付「偶尔要把长文本强推过去」，
+		// 又不至于一次把几 MB 的内容塞进远端文件。
+		ManualMaxTextChars: 10000,
+		LogToFile:          true,
+		LogRetainDays:      7,
+		LogMaxFileMB:       defaultLogFileMB,
+		UIPort:             defaultUIPort,
 	}
 }
 
@@ -209,14 +214,11 @@ func (c *Config) normalize() {
 	if c.PollSeconds > 3600 {
 		c.PollSeconds = 3600
 	}
-	if c.LocalPollMillis < 200 {
-		c.LocalPollMillis = d.LocalPollMillis
+	if c.LocalPollSeconds < 1 {
+		c.LocalPollSeconds = d.LocalPollSeconds
 	}
-	if c.LocalPollMillis > 60000 {
-		c.LocalPollMillis = 60000
-	}
-	if c.HashMode != HashModeEmpty {
-		c.HashMode = HashModeSHA256
+	if c.LocalPollSeconds > 60 {
+		c.LocalPollSeconds = 60
 	}
 	// 端口必须是一个能绑的合法端口号。非法值（手改配置、越界、早期版本留下的 0）
 	// 一律退回默认端口——0 不再有「随机挑一个」的含义，留着它只会让启动失败。
@@ -225,6 +227,10 @@ func (c *Config) normalize() {
 	}
 	if c.MaxTextChars < 0 {
 		c.MaxTextChars = 0
+	}
+	// 负数视为非法（手改配置）；0 是合法值，含义是「不限制」
+	if c.ManualMaxTextChars < 0 {
+		c.ManualMaxTextChars = 0
 	}
 	if c.LogRetainDays < 0 {
 		c.LogRetainDays = 0

@@ -271,7 +271,7 @@ func TestAPISaveWithBlankPasswordKeepsStored(t *testing.T) {
 	// 界面不会回显明文，所以提交上来的 password 是空的
 	body := `{"davUrl":"` + engine.Config().DavURL + `","remotePath":"xime",
 	          "username":"u","password":"","deviceName":"pc","enabled":true,
-	          "pollSeconds":30,"localPollMillis":1000,"hashMode":"sha256",
+	          "pollSeconds":30,"localPollSeconds":5,
 	          "maxTextChars":1000,"logToFile":true,"logRetainDays":7,"uiPort":9099}`
 	resp, err := http.Post(ui.URL+"/api/config/save", "application/json", strings.NewReader(body))
 	if err != nil {

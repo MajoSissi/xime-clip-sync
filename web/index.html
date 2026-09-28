@@ -302,9 +302,16 @@
           <input type="checkbox" id="enabled">
           <span class="lbl">启用同步</span>
         </label>
-        <div class="field">
-          <label for="maxTextChars">文本长度上限（字符）</label>
-          <input type="number" id="maxTextChars" min="0" step="100" title="0 表示不限制">
+        <div class="row">
+          <div class="field">
+            <label for="maxTextChars">自动推送-文本长度上限（字符）</label>
+            <input type="number" id="maxTextChars" min="0" step="100" title="0 表示不限制">
+          </div>
+          <div class="field">
+            <label for="manualMaxTextChars">手动推送-文本长度上限上限（字符）</label>
+            <input type="number" id="manualMaxTextChars" min="0" step="100"
+                   title="托盘与右上角「推送」按钮用它，可以突破左边那个上限；0 表示不限制">
+          </div>
         </div>
         <div class="row">
           <div class="field">
@@ -312,16 +319,9 @@
             <input type="number" id="pollSeconds" min="3" max="3600">
           </div>
           <div class="field">
-            <label for="localPollMillis">本地检查间隔（毫秒）</label>
-            <input type="number" id="localPollMillis" min="200" max="60000">
+            <label for="localPollSeconds">本地检查间隔（秒）</label>
+            <input type="number" id="localPollSeconds" min="1" max="60">
           </div>
-        </div>
-        <div class="field">
-          <label for="hashMode">hash 字段模式</label>
-          <select id="hashMode">
-            <option value="sha256">sha256（本地计算）</option>
-            <option value="empty">留空（交给对端计算）</option>
-          </select>
         </div>
       </div>
     </section>
@@ -345,7 +345,7 @@
 
       <div class="previews">
         <div class="preview">
-          <div class="k">本地已同步内容</div>
+          <div class="k">本地内容</div>
           <div class="v" id="curText">—</div>
         </div>
         <div class="preview">
@@ -423,10 +423,10 @@
 const $ = (id) => document.getElementById(id);
 
 const FIELDS = ["davUrl","remotePath","username","password","deviceName","pollSeconds",
-                "localPollMillis","hashMode","maxTextChars","enabled","insecureSkipVerify",
+                "localPollSeconds","maxTextChars","manualMaxTextChars","enabled","insecureSkipVerify",
                 "autostart","logToFile","logRetainDays","logMaxFileMB","uiPort"];
 const BOOLS = ["enabled","insecureSkipVerify","autostart","logToFile"];
-const NUMS = ["pollSeconds","localPollMillis","maxTextChars","logRetainDays","logMaxFileMB","uiPort"];
+const NUMS = ["pollSeconds","localPollSeconds","maxTextChars","manualMaxTextChars","logRetainDays","logMaxFileMB","uiPort"];
 const TABS = ["sync","status","app"];
 
 // 把文本放进 innerHTML 前转义。提示文案里可能夹着系统错误信息，

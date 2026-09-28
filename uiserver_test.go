@@ -537,7 +537,7 @@ func TestSaveWithUnavailablePortWarnsAndKeepsUI(t *testing.T) {
 	// 把用户机器上的自启设置弄成测试的副作用。
 	body := fmt.Sprintf(`{"davUrl":"https://host/dav/","remotePath":"xime/clipboard/current.json",
 	  "username":"u","password":"","deviceName":"pc","enabled":true,
-	  "pollSeconds":30,"localPollMillis":1000,"hashMode":"sha256",
+	  "pollSeconds":30,"localPollSeconds":5,
 	  "maxTextChars":1000,"logToFile":false,"logRetainDays":7,
 	  "autostart":%v,"uiPort":%d}`, autostartEnabled(), taken)
 
@@ -661,7 +661,7 @@ func TestSaveReportsEveryWarningNotJustFirst(t *testing.T) {
 	// autostart 回填当前真实状态，避免测试去改用户机器上的注册表。
 	body := fmt.Sprintf(`{"davUrl":"https://host/dav/","remotePath":"xime/clipboard/current.json",
 	  "username":"u","password":"","deviceName":"pc","enabled":true,
-	  "pollSeconds":30,"localPollMillis":1000,"hashMode":"sha256",
+	  "pollSeconds":30,"localPollSeconds":5,
 	  "maxTextChars":1000,"logToFile":true,"logRetainDays":7,
 	  "autostart":%v,"uiPort":%d}`, autostartEnabled(), base)
 
@@ -898,6 +898,21 @@ func TestDefaultsEndpointReturnsFactoryDefaults(t *testing.T) {
 	}
 	if got["logRetainDays"] != float64(7) {
 		t.Errorf("出厂默认日志保留天数应为 7，实际 %v", got["logRetainDays"])
+	}
+	// 「本地检查间隔」的单位是秒，出厂默认 5。这条同时守着两件事：
+	// 值本身，以及「它有没有被漏在这份默认值之外」——漏了的话，
+	// 界面上「恢复默认值」会把这一项**静默跳过**（按钮点了、提示也弹了，就是没回去）。
+	if got["localPollSeconds"] != float64(5) {
+		t.Errorf("出厂默认本地检查间隔应为 5 秒，实际 %v", got["localPollSeconds"])
+	}
+	// 手动推送上限也要在这份默认值里：界面「恢复默认值」是按 id 取数的，
+	// 少了它这一项会被**静默跳过**（按钮点了、提示也弹了，就是没回去）。
+	if got["manualMaxTextChars"] != float64(10000) {
+		t.Errorf("出厂默认手动推送上限应为 10000，实际 %v", got["manualMaxTextChars"])
+	}
+	// hash 模式不再是配置项（固定本地 SHA-256），不该出现在默认值里
+	if _, ok := got["hashMode"]; ok {
+		t.Error("hashMode 已从配置里删掉，默认值接口不该再返回它")
 	}
 	// 端口也要给出来：界面上「恢复默认值」是按 DOM 现扫 id 去这份默认值里取数的，
 	// 少了它端口就会被**静默跳过**（按钮点了、提示也弹了，就是端口没回去）。

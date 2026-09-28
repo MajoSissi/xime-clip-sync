@@ -367,7 +367,7 @@ func TestRelativeDirParts(t *testing.T) {
 
 // wire 格式必须是 snake_case，且与插件 JSON.stringify 的字段一致
 func TestProfileWireFormat(t *testing.T) {
-	p := newTextProfile("你好 hello", "my-pc", HashModeSHA256)
+	p := newTextProfile("你好 hello", "my-pc")
 	data, err := p.encode()
 	if err != nil {
 		t.Fatal(err)
@@ -389,16 +389,6 @@ func TestProfileWireFormat(t *testing.T) {
 	}
 	if m["hash"] != hashText("你好 hello") {
 		t.Errorf("hash 不符：%v", m["hash"])
-	}
-}
-
-func TestProfileEmptyHashMode(t *testing.T) {
-	p := newTextProfile("x", "", HashModeEmpty)
-	if p.Hash != "" {
-		t.Errorf("empty 模式下 hash 应为空，实际 %q", p.Hash)
-	}
-	if p.Source != nil {
-		t.Errorf("空设备名时 source 应为 null")
 	}
 }
 
@@ -479,7 +469,7 @@ func TestHeadTail(t *testing.T) {
 	}
 }
 
-// 界面上「本地已同步内容」「远端内容」超过 150 字符就截断并补省略号。
+// 界面上「本地内容」「远端内容」超过 150 字符就截断并补省略号。
 func TestStatusPreviewTruncatesAt150(t *testing.T) {
 	if previewLen != 150 {
 		t.Fatalf("previewLen = %d，期望 150", previewLen)
@@ -806,10 +796,22 @@ func TestConfigNormalize(t *testing.T) {
 	d := defaultConfig()
 	// 默认值本身就是需求的一部分，单独钉住
 	if d.MaxTextChars != 300 {
-		t.Errorf("文本长度上限默认值应为 300，实际 %d", d.MaxTextChars)
+		t.Errorf("自动推送文本长度上限默认值应为 300，实际 %d", d.MaxTextChars)
 	}
 	if d.LogRetainDays != 7 {
 		t.Errorf("日志保留天数默认值应为 7，实际 %d", d.LogRetainDays)
+	}
+	// 本地检查间隔的单位是**秒**（2026-09-28 从毫秒改成秒，默认 5）
+	if d.LocalPollSeconds != 5 {
+		t.Errorf("本地检查间隔默认值应为 5 秒，实际 %d", d.LocalPollSeconds)
+	}
+	// 手动推送（托盘/界面「推送」按钮）另有更宽的上限，默认 10000
+	if d.ManualMaxTextChars != 10000 {
+		t.Errorf("手动推送上限默认值应为 10000，实际 %d", d.ManualMaxTextChars)
+	}
+	if d.ManualMaxTextChars <= d.MaxTextChars {
+		t.Errorf("手动推送上限（%d）应比自动同步的自动推送文本长度上限（%d）宽，否则这个配置项没意义",
+			d.ManualMaxTextChars, d.MaxTextChars)
 	}
 	if !d.Enabled || !d.LogToFile {
 		t.Errorf("同步与日志落盘默认应为开启：%+v", d)
@@ -817,21 +819,38 @@ func TestConfigNormalize(t *testing.T) {
 
 	c := Config{}
 	c.normalize()
-	if c.PollSeconds != d.PollSeconds || c.LocalPollMillis != d.LocalPollMillis || c.HashMode != HashModeSHA256 {
+	if c.PollSeconds != d.PollSeconds || c.LocalPollSeconds != d.LocalPollSeconds {
 		t.Errorf("默认值异常：%+v", c)
 	}
 	c.PollSeconds = 1
-	c.HashMode = "bogus"
 	c.normalize()
-	if c.PollSeconds < 3 || c.HashMode != HashModeSHA256 {
+	if c.PollSeconds < 3 {
 		t.Errorf("归一化失败：%+v", c)
+	}
+
+	// 本地检查间隔：低于 1 秒退回默认（0 会让轮询变成忙等），高于 60 秒封顶
+	c.LocalPollSeconds = 0
+	c.normalize()
+	if c.LocalPollSeconds != d.LocalPollSeconds {
+		t.Errorf("本地检查间隔 0 应退回默认 %d，实际 %d", d.LocalPollSeconds, c.LocalPollSeconds)
+	}
+	c.LocalPollSeconds = -7
+	c.normalize()
+	if c.LocalPollSeconds != d.LocalPollSeconds {
+		t.Errorf("本地检查间隔负数应退回默认 %d，实际 %d", d.LocalPollSeconds, c.LocalPollSeconds)
+	}
+	c.LocalPollSeconds = 999
+	c.normalize()
+	if c.LocalPollSeconds != 60 {
+		t.Errorf("本地检查间隔上限应为 60 秒，实际 %d", c.LocalPollSeconds)
 	}
 
 	// 负数应归零（0 表示不限制 / 永久保留），保留天数还要封顶
 	c.MaxTextChars = -5
+	c.ManualMaxTextChars = -5
 	c.LogRetainDays = -3
 	c.normalize()
-	if c.MaxTextChars != 0 || c.LogRetainDays != 0 {
+	if c.MaxTextChars != 0 || c.ManualMaxTextChars != 0 || c.LogRetainDays != 0 {
 		t.Errorf("负数应归零：%+v", c)
 	}
 	c.LogRetainDays = 9999
@@ -846,6 +865,154 @@ func TestConfigNormalize(t *testing.T) {
 	c.normalize()
 	if c.DavURL != "https://host/dav/" || c.RemotePath != "xime" {
 		t.Errorf("空白清理失败：%+v", c)
+	}
+}
+
+// 「本地检查间隔」的单位是**秒**（2026-09-28 从毫秒改成秒，默认 5）。
+//
+// 这条守住的是「只改了界面文案和字段名、忘了改换算倍数」——那种情况下配置里存的是 5，
+// 实际却按 5 **毫秒**轮询：剪贴板被高频读取，CPU 白转，而界面上一点异常都看不出来。
+func TestLocalPollIntervalIsSeconds(t *testing.T) {
+	cfg := testConfig("")
+	cfg.LocalPollSeconds = 5
+	e := NewSyncEngine(cfg, &fakeClipboard{}, NewLogBuffer(10))
+	if got := e.localInterval(); got != 5*time.Second {
+		t.Errorf("配置 5 秒时实际间隔应为 5s，得到 %v（换算倍数写错了？）", got)
+	}
+
+	cfg.LocalPollSeconds = 60
+	e.UpdateConfig(cfg)
+	if got := e.localInterval(); got != time.Minute {
+		t.Errorf("配置 60 秒时实际间隔应为 1m，得到 %v", got)
+	}
+}
+
+// 超过上限的内容既不该推送到远端，也**不该出现在界面的「本地内容」里**。
+//
+// 「本地内容」那一栏的语义是「本地与远端一致的那份内容」，不是「剪贴板里现在有什么」。
+// 曾经的做法是把超长内容也写进 current（当时是为了让告警只报一次），
+// 结果界面上显示出一段根本没同步过去的内容——用户看到的和实际发生的不一致。
+//
+// 顺带钉住第二个后果：超长内容**不能被随后的远端轮询冲掉**。
+// 若把超长内容写进 current，远端轮询会发现 remote != current，
+// 于是把远端那份旧内容写回剪贴板，用户刚复制的那段长文本就没了。
+func TestOversizeNotShownAsCurrentText(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	cfg := engine.Config()
+	cfg.MaxTextChars = 10
+	engine.UpdateConfig(cfg)
+
+	engine.prime()
+
+	// 先同步一条正常内容，作为「本地内容」的基线
+	short := "短内容"
+	clip.set(short)
+	engine.checkLocalOnly()
+	if st := engine.Status(); st.CurrentText != preview(short, previewLen) {
+		t.Fatalf("基线没建立：「本地内容」= %q", st.CurrentText)
+	}
+	remoteBefore, ok := fake.file(remoteFilePath)
+	if !ok {
+		t.Fatal("基线内容没推到远端")
+	}
+	writesBefore := clip.sets()
+
+	// 复制一段超长内容。**先只跑本地检查**：这一步才是「界面上会不会显示出来」的关键。
+	// （不能直接跑整轮——拉取阶段可能会把 current 又改回去，
+	//   那样中间那一瞬间的错误显示就被盖掉了，断言反而漏掉。）
+	long := strings.Repeat("长", 11)
+	clip.set(long)
+	engine.checkLocalOnly()
+
+	st := engine.Status()
+	if strings.Contains(st.CurrentText, "长") {
+		t.Errorf("超长内容不该出现在「本地内容」里，实际 %q", st.CurrentText)
+	}
+	if st.CurrentText != preview(short, previewLen) {
+		t.Errorf("超长时「本地内容」应保持上一次同步成功的内容 %q，实际 %q",
+			preview(short, previewLen), st.CurrentText)
+	}
+	if got, _ := fake.file(remoteFilePath); got != remoteBefore {
+		t.Error("超长内容不该推送到远端")
+	}
+	if st.OversizeCount != 1 {
+		t.Errorf("超长跳过次数应为 1，实际 %d", st.OversizeCount)
+	}
+
+	// 再跑一整轮（含远端拉取）：用户刚复制的长文本还在剪贴板上，不能被冲掉。
+	// 若把超长内容写进 current，远端轮询会发现 remote != current，
+	// 于是把远端那份旧内容写回剪贴板。
+	engine.syncCycle(true)
+	if got, _ := clip.GetText(); got != long {
+		t.Errorf("剪贴板里的长文本被冲掉了：%q", got)
+	}
+	if n := clip.sets(); n != writesBefore {
+		t.Errorf("超长内容不该导致任何剪贴板写入，实际多写了 %d 次", n-writesBefore)
+	}
+}
+
+// 手动推送（托盘菜单与界面右上角的「推送」按钮共用 PushNow）用「手动推送上限」，
+// 可以突破自动同步的「文本长度上限」——偶尔确实需要把一段长文本强推过去。
+// 两个上限互不影响：自动同步仍然只看 MaxTextChars。
+func TestManualPushBypassesAutoLimit(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	cfg := engine.Config()
+	cfg.MaxTextChars = 10         // 自动同步：10 字符以内
+	cfg.ManualMaxTextChars = 1000 // 手动推送：放宽到 1000
+	engine.UpdateConfig(cfg)
+
+	long := strings.Repeat("长", 11)
+
+	// 自动同步会跳过它（超自动上限）
+	clip.set(long)
+	engine.checkLocalOnly()
+	if _, ok := fake.file(remoteFilePath); ok {
+		t.Error("超自动上限的内容不该被自动推送")
+	}
+	if st := engine.Status(); st.OversizeCount != 1 {
+		t.Errorf("自动跳过计数应为 1，实际 %d", st.OversizeCount)
+	}
+
+	// 同一份内容，手动推送应成功
+	if err := engine.PushNow(); err != nil {
+		t.Fatalf("手动推送应能突破自动上限，却失败：%v", err)
+	}
+	if got, ok := fake.file(remoteFilePath); !ok || !strings.Contains(got, long) {
+		t.Error("手动推送的内容没到远端")
+	}
+	// 推成功了就是「已达成一致的那份」，界面「本地内容」要跟着更新
+	if st := engine.Status(); !strings.Contains(st.CurrentText, "长") {
+		t.Errorf("手动推送成功后「本地内容」应更新，实际 %q", st.CurrentText)
+	}
+
+	// 超过「手动推送上限」时，手动推送也要拦住，且报错要说清是哪个上限
+	cfg.ManualMaxTextChars = 10
+	engine.UpdateConfig(cfg)
+	err := engine.PushNow()
+	if err == nil {
+		t.Fatal("超过手动推送上限时，手动推送应被拦住")
+	}
+	if !strings.Contains(err.Error(), "手动推送上限") {
+		t.Errorf("报错要说明是哪个上限被突破失败，实际 %q", err.Error())
+	}
+
+	// 0 = 不限制
+	cfg.ManualMaxTextChars = 0
+	engine.UpdateConfig(cfg)
+	if err := engine.PushNow(); err != nil {
+		t.Errorf("手动推送上限为 0（不限制）时不该拦住：%v", err)
 	}
 }
 
@@ -920,7 +1087,7 @@ func TestNoRedundantStartupFetch(t *testing.T) {
 
 	cfg := testConfig(srv.URL)
 	cfg.PollSeconds = 60 // 远大于下面的观察窗口
-	cfg.LocalPollMillis = 10000
+	cfg.LocalPollSeconds = 60
 	engine := NewSyncEngine(cfg, clip, NewLogBuffer(100))
 
 	ctx, cancel := context.WithCancel(context.Background())
