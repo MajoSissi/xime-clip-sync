@@ -29,23 +29,23 @@ const (
 	processPerMonitorDPIAware = 2
 )
 
-// enableDPIAwareness 尽力把当前进程声明为 DPI 感知，返回实际生效的方式。
+// enableDPIAwareness 尽力把当前进程声明为 DPI 感知，返回是否成功。
 //
 // 必须**在创建任何窗口之前**调用，否则设置不生效。
 // 系统版本越老，可用的 API 越少，所以逐级回退；全部失败也不算致命
 // （最坏就是托盘图标被系统拉伸，程序照常工作）。
-func enableDPIAwareness() string {
+func enableDPIAwareness() bool {
 	// Windows 10 1703+
 	if r, _, _ := procSetProcessDpiAwarenessContext.Call(dpiAwarenessPerMonitorV2); r != 0 {
-		return "Per-Monitor V2"
+		return true
 	}
 	// Windows 8.1+：返回 HRESULT，S_OK(0) 表示成功
 	if r, _, _ := procSetProcessDpiAwareness.Call(processPerMonitorDPIAware); r == 0 {
-		return "Per-Monitor"
+		return true
 	}
 	// Vista+
 	if r, _, _ := procSetProcessDPIAware.Call(); r != 0 {
-		return "System"
+		return true
 	}
-	return ""
+	return false
 }

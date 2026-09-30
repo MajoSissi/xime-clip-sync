@@ -71,9 +71,6 @@ type trayCallbacks struct {
 	Tooltip func() string
 	// MenuStatus 返回右键菜单顶部的状态文字。
 	MenuStatus func() trayMenuStatus
-	// Logf 记录托盘自身的运行信息（例如实际采用的图标尺寸）。
-	// 没有控制台的构建里，日志是唯一能观察到这些细节的渠道。
-	Logf func(format string, args ...any)
 }
 
 // trayApp 是系统托盘图标。

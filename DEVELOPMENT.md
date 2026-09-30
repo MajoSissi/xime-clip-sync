@@ -22,7 +22,7 @@ go build -ldflags "-s -w -H=windowsgui" -o build/xime-clip-sync.exe
 
 ⚠️ **别在项目根跑 `go build ./...`**——会吐一个不带 `-s -w` 的 exe。日常检查用 `go vet ./...` / `go test ./...`。
 
-当前产物：`build/xime-clip-sync.exe`，v1.3.0，仅 Windows/amd64，8,561,152 字节。
+当前产物：`build/xime-clip-sync.exe`，v1.3.0，仅 Windows/amd64，8,564,736 字节。
 
 **换图标只需替换 `img/logo.ico` 后重新构建**，不用改任何代码。
 
@@ -116,7 +116,52 @@ go build -ldflags "-s -w -H=windowsgui" -o build/xime-clip-sync.exe
 
 ---
 
-## 六、日志实现
+## 六、出网：代理与传输层重试
+
+### 代理
+
+`proxyMode` 四档（`system` / `http` / `socks5` / `none`），`proxyFuncForConfig` 把它翻译成
+`http.Transport.Proxy` 回调；返回 nil 就是直连。默认 `system`。
+
+| 模式 | 怎么选路 |
+|------|---------|
+| `system` | 读 `HKCU\...\Internet Settings` 的 `ProxyEnable` / `ProxyServer` / `ProxyOverride`（`proxy_windows.go`） |
+| `http` / `socks5` | 用 `proxyUrl` 拼出 `http://host:port` / `socks5://host:port`；scheme 以**模式**为准 |
+| `none` | 返回 nil，直连 |
+
+三个刻意的决定：
+
+- **系统代理只读注册表，不叠加 `HTTP_PROXY` 环境变量。** `http.ProxyFromEnvironment` 只认环境变量，
+  而从资源管理器双击启动的 GUI 进程没有 shell 的环境变量——用它的话「系统代理」会看起来有、
+  实际不生效。混用两套来源还会让同一个设置在不同启动方式下行为不同，比不生效更难查。
+- **选了 `http` / `socks5` 却没填地址（或地址解析不出来）时，Proxy 回调返回错误**，
+  不静默退回直连。用户选代理往往就是为了让流量走代理，悄悄直连比同步报错更糟。
+- **`ProxyOverride` 必须支持「通配符在中间」**（`127.*`、`192.168.*`）。这是系统默认列表的实际写法，
+  只做后缀匹配的话局域网自建 WebDAV 会被硬塞进代理直接连不上。见 `matchWildcard`。
+
+`ProxyServer` 有两种写法都要认：裸 `host:port`（所有协议共用），
+以及 `http=...;https=...`（按协议分开；没列出当前协议就直连）。
+
+⚠️ **测试里一律 `ProxyMode = none`**（见 `testConfig`）。照抄默认值的话，这套测试会去读
+**开发机自己的注册表**——本机配了系统代理时，指向 `127.0.0.1` 的 `httptest` 请求会被塞进真代理，
+测试随机器而红或绿。
+
+### 传输层重试
+
+`webdavClient.request` 对传输层错误**立刻重试一次**，间隔 `transferRetryDelay`（500ms），
+并记一条 warn（`TestTransferErrorRetriesOnce` 盯着「只重试一次」且「必须留痕」）。
+
+**超时类错误不重试**（`transportErrIsRetriable`）。理由不是省事：`Client.Timeout` 是 30 秒，
+重试会再等一个 30 秒，而这段时间 `syncMu` 被占着，连本地剪贴板的推送都跟着停摆。
+这条规则同时保证了「重试」只给最坏情况增加 500 毫秒，而不是 30 秒。
+
+> Go 自己在 `net/http` 里也会重试，但条件很窄：**只有复用连接（keep-alive）被对端关掉**时才会
+> （`transport.go` 的 `shouldRetryRequest`：`if !pc.isReused() { return false }`）。
+> 全新连接上的 DNS 失败、连接被拒、超时一律不重试——这正是这里要补的那一段。
+
+---
+
+## 七、日志实现
 
 日志按天分文件写在 **exe 同目录的 `logs/`**：
 
@@ -136,7 +181,7 @@ go build -ldflags "-s -w -H=windowsgui" -o build/xime-clip-sync.exe
 
 ---
 
-## 七、图标与 DPI
+## 八、图标与 DPI
 
 图标只有**一个来源**：仓库里的 `img/logo.ico`，程序里**没有任何「画图标」的代码**。
 
@@ -159,12 +204,7 @@ SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) Windows 8.1+
 SetProcessDPIAware()                                  Vista+
 ```
 
-生效后 `GetSystemMetrics` 返回真实尺寸。日志里能看到结果：
-
-```
-DPI 感知已启用：Per-Monitor V2
-托盘图标已就绪：24×24（系统要求 24×24，来自 img/logo.ico）
-```
+生效后 `GetSystemMetrics` 返回真实尺寸，托盘图标按系统要的边长 1:1 绘制（失败才记一条 warn）。
 
 挑档策略：正好相等 > 比目标大的里面最小的 > 最大的那一档（宁可缩小丢像素，也不放大插值发虚）。
 
@@ -178,13 +218,15 @@ DPI 感知已启用：Per-Monitor V2
 
 ---
 
-## 八、文件结构
+## 九、文件结构
 
 ```
 xime-clip-sync/
 ├── main.go                 入口、命令行参数、装配同步循环/配置界面/托盘
 ├── sync.go                 同步引擎（推/拉、回声抑制、限流退避、长度上限）
-├── webdav.go               WebDAV 客户端（PUT/GET/PROPFIND/MKCOL）
+├── webdav.go               WebDAV 客户端（PUT/GET/PROPFIND/MKCOL、传输层重试）
+├── proxy.go                代理模式与 Proxy 回调（模式校验、代理 URL 组装）
+├── proxy_windows.go        Windows：读注册表里的系统代理 + ProxyOverride 绕过匹配
 ├── davurl.go               远端 URL 组装（对齐插件 dav-url.ts）
 ├── profile.go              远端 JSON Profile 编解码 + 界面用的格式化清单
 ├── clipboard.go            剪贴板接口定义
@@ -217,10 +259,10 @@ xime-clip-sync/
 
 ---
 
-## 九、测试
+## 十、测试
 
 ```bash
-go test ./...          # 全部 93 个
+go test ./...          # 全部 107 个
 go test ./... -short   # 跳过会改动真实剪贴板/注册表的测试
 ```
 
@@ -264,9 +306,10 @@ Basic Auth、本地→远端、远端→本地、回声抑制、ETag 304、503 �
 | 状态行只做二选一（正常 / 异常） | `TestTrayMenuSyncLabel` |
 | 状态行文案写死、够短（≤14 字）、无占位符字面量 | `TestTraySyncTextsAreShort` |
 | 每个配置字段都在界面 FIELDS 里（漏了会静默丢设置） | `TestEveryConfigFieldIsInTheForm` |
-| 「程序设置」页每个输入框 id 都是配置字段名 | `TestAppPageFieldsAreConfigFields` |
-| 「恢复默认值」按钮在本页里、且本页没有排除项 | `TestRestoreButtonScope` |
-| 默认值接口回**出厂默认**、不含密码材料、不再返回已删的 `hashMode` | `TestDefaultsEndpointReturnsFactoryDefaults` |
+| 代理：模式校验、代理 URL 组装、选了代理没填地址要报错（不静默直连） | `TestProxyModeDefault`、`TestProxyModeNormalize`、`TestProxyURLFromConfig`、`TestProxyWithoutAddressFailsLoudly`、`TestProxyWithUnparsableAddressFails`、`TestProxyModeNoneIsDirect`、`TestManualProxyReachesTransport`、`TestSystemProxyFuncIsWired` |
+| 请求**真的**经过代理 / 「不代理」时真的不过代理 | `TestHTTPProxyIsActuallyUsed`、`TestProxyModeNoneBypassesProxy` |
+| 系统代理：`ProxyServer` 两种写法、`ProxyOverride` 通配符绕过 | `TestSystemProxyURL`、`TestBypassProxy`、`TestBypassProxyRealWorldList`、`TestReadSystemProxyDoesNotPanic` |
+| 传输层错误重试一次；超时类不重试（否则 30 秒阻塞翻倍） | `TestTransportErrIsRetriable`、`TestTransferErrorRetriesOnce`、`TestTimeoutIsNotRetried` |
 | 失败原因分类（端口冲突 vs 未运行） | `TestUIFailReasonOf`、`TestUIFailReasonOnRealBindFailure` |
 | 「起过又没了」要能和「在跑」区分 | `TestUIServerFailedOnlyOnUnexpectedExit` |
 | 打开配置界面失败会弹气泡 | `TestOpenUIReportsFailureOnBalloon`、`TestOpenUISuccessStaysSilent` |
@@ -284,7 +327,7 @@ Basic Auth、本地→远端、远端→本地、回声抑制、ETag 304、503 �
 
 ---
 
-## 十、改配置项时的三处平行清单
+## 十一、改配置项时的三处平行清单
 
 Go 结构体 / 前端 `FIELDS` 数组 / 页面 `<input id>` 三处必须同步。**漏了 `FIELDS` → 每次保存静默丢掉用户填的值**，
 配 `TestEveryConfigFieldIsInTheForm` 守着。

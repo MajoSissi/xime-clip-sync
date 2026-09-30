@@ -85,11 +85,6 @@
   @media (max-width: 1020px) {
     .page.sync, .page.app, .page.status { grid-template-columns: minmax(0, 1fr); }
   }
-  /* 跨两列的页面级动作条（「程序设置」页底部的「恢复默认值」） */
-  .page .span-all { grid-column: 1 / -1; }
-  /* 去掉卡片的内边距/底色/描边，只留 .card-actions 那条虚线分隔，
-     读起来是「本页的收尾操作」，而不是又一张卡片。 */
-  section.plain { padding: 0; background: transparent; border: 0; }
 
   section {
     background: var(--panel);
@@ -288,6 +283,22 @@
           <input type="checkbox" id="insecureSkipVerify">
           <span class="lbl">跳过 TLS 证书校验</span>
         </label>
+        <div class="row">
+          <div class="field">
+            <label for="proxyMode">代理</label>
+            <select id="proxyMode">
+              <option value="system">系统代理</option>
+              <option value="http">HTTP 代理</option>
+              <option value="socks5">SOCKS5 代理</option>
+              <option value="none">不代理</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="proxyUrl">代理地址</label>
+            <input type="text" id="proxyUrl" placeholder="127.0.0.1:7890"
+                   title="只填 host:port，不用写 http:// 或 socks5://；选「系统代理」「不代理」时这一项不生效">
+          </div>
+        </div>
       </div>
       <div class="card-actions">
         <button id="btnTest">测试连接</button>
@@ -408,14 +419,6 @@
       </div>
     </section>
 
-    <section class="span-all plain">
-      <div class="card-actions">
-        <button id="btnRestore"
-                title="把本页各项恢复为出厂默认；恢复后点右上角「保存并应用」才生效">恢复默认值</button>
-        <div id="restoreToast" class="toast"></div>
-      </div>
-    </section>
-
   </div>
 </main>
 
@@ -424,6 +427,7 @@ const $ = (id) => document.getElementById(id);
 
 const FIELDS = ["davUrl","remotePath","username","password","deviceName","pollSeconds",
                 "localPollSeconds","maxTextChars","manualMaxTextChars","enabled","insecureSkipVerify",
+                "proxyMode","proxyUrl",
                 "autostart","logToFile","logRetainDays","logMaxFileMB","uiPort"];
 const BOOLS = ["enabled","insecureSkipVerify","autostart","logToFile"];
 const NUMS = ["pollSeconds","localPollSeconds","maxTextChars","manualMaxTextChars","logRetainDays","logMaxFileMB","uiPort"];
@@ -476,6 +480,15 @@ function showTab(name) {
   }
 }
 
+// 代理地址只在「HTTP 代理 / SOCKS5 代理」下有意义，其余模式把它置灰。
+// 留着可编辑会让人以为填了就生效——「系统代理」是去读系统设置，不看这个框。
+function syncProxyField() {
+  const needAddr = ["http", "socks5"].includes($("proxyMode").value);
+  const el = $("proxyUrl");
+  el.disabled = !needAddr;
+  el.placeholder = needAddr ? "127.0.0.1:7890" : "当前代理模式不需要地址";
+}
+
 function fillForm(cfg) {
   for (const k of FIELDS) {
     const el = $(k);
@@ -489,6 +502,7 @@ function fillForm(cfg) {
   const pw = $("password");
   pw.value = "";
   pw.placeholder = cfg.passwordSaved ? "已保存，留空则不修改" : "请输入密码";
+  syncProxyField();
 }
 
 function readForm() {
@@ -585,33 +599,6 @@ async function save() {
   else toast("配置已保存并生效", true);
 }
 
-// 恢复默认值：把「程序设置」这一页的输入项恢复成出厂默认（取自 /api/defaults）。
-//
-// 恢复哪些项是**从 DOM 现扫的**（#page-app 里的 input/select），而不是在这里再抄
-// 一份字段清单——平行清单漏一项就会静默不生效，页面上还看不出任何异常。
-// 这一页的每一项都参与恢复，没有例外（监听端口也恢复成默认端口）。
-//
-// 只填表、不保存：保存是顶栏「保存并应用」的职责。这里替用户点下去，
-// 等于「按一下按钮改一堆设置」，他连改了什么都没看清。
-async function restoreDefaults() {
-  let defs;
-  try {
-    defs = await api("/api/defaults");
-  } catch (e) {
-    inlineToast("restoreToast", "取默认值失败：" + e.message, false, 8000);
-    return;
-  }
-  const has = Object.prototype.hasOwnProperty;
-  let n = 0;
-  for (const el of document.querySelectorAll("#page-app input, #page-app select")) {
-    if (!el.id || !has.call(defs, el.id)) continue;
-    if (el.type === "checkbox") el.checked = !!defs[el.id];
-    else el.value = defs[el.id] === undefined || defs[el.id] === null ? "" : defs[el.id];
-    n++;
-  }
-  inlineToast("restoreToast", "已恢复 " + n + " 项默认值，点右上角「保存并应用」生效", true, 8000);
-}
-
 async function init() {
   for (const t of TABS) $("tab-" + t).onclick = () => showTab(t);
   window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
@@ -626,7 +613,7 @@ async function init() {
   es.addEventListener("log", (e) => addLog(JSON.parse(e.data)));
 
   $("btnSave").onclick = save;
-  $("btnRestore").onclick = restoreDefaults;
+  $("proxyMode").onchange = syncProxyField;
   $("btnTest").onclick = async () => {
     const btn = $("btnTest");
     btn.disabled = true;

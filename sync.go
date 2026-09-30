@@ -106,7 +106,7 @@ func NewSyncEngine(cfg Config, clip Clipboard, log *LogBuffer) *SyncEngine {
 		cfg:    cfg,
 		clip:   clip,
 		log:    log,
-		client: newWebDAVClient(cfg),
+		client: newWebDAVClient(cfg, log),
 		wake:   make(chan struct{}, 1),
 	}
 	if _, ok := clip.(seqClipboard); ok {
@@ -122,7 +122,7 @@ func (e *SyncEngine) UpdateConfig(cfg Config) {
 	cfg.normalize()
 	e.mu.Lock()
 	e.cfg = cfg
-	e.client = newWebDAVClient(cfg)
+	e.client = newWebDAVClient(cfg, e.log)
 	e.lastETag = ""              // 服务器/目录可能已变，ETag 缓存作废
 	e.backoffUntil = time.Time{} // 配置变更往往就是在修正问题，解除退避
 	e.mu.Unlock()
@@ -666,6 +666,6 @@ func (e *SyncEngine) PullNow() error {
 }
 
 // TestConnection 使用给定配置测试 WebDAV 连通性。
-func TestConnection(cfg Config) error {
-	return newWebDAVClient(cfg).testConnection()
+func TestConnection(cfg Config, log *LogBuffer) error {
+	return newWebDAVClient(cfg, log).testConnection()
 }

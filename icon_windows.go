@@ -26,20 +26,17 @@ const (
 	smCySmIcon = 50
 )
 
-// createAppIcon 创建托盘图标，返回 HICON（用完需 DestroyIcon）以及采用的边长。
-//
-// 返回的边长用于日志：托盘图标「糊不糊」取决于这一档是不是正好等于系统要的尺寸，
-// 而没有控制台的构建里只能靠日志看到它。
-func createAppIcon() (uintptr, int, error) {
+// createAppIcon 创建托盘图标，返回 HICON（用完需 DestroyIcon）。
+func createAppIcon() (uintptr, error) {
 	entries, err := parseICO(logoICO)
 	if err != nil {
-		return 0, 0, fmt.Errorf("读取内嵌图标失败：%w", err)
+		return 0, fmt.Errorf("读取内嵌图标失败：%w", err)
 	}
 
 	want := smallIconSize()
 	entry, ok := pickICO(entries, want)
 	if !ok {
-		return 0, 0, fmt.Errorf("内嵌图标里没有可用尺寸")
+		return 0, fmt.Errorf("内嵌图标里没有可用尺寸")
 	}
 	// 交给 Windows 的尺寸就用 want：DPI 感知生效时它就是任务栏真正要的边长
 	// （100% 缩放 16、150% 缩放 24……），此时 pickICO 会挑到同一档，1:1 绘制。
@@ -54,9 +51,9 @@ func createAppIcon() (uintptr, int, error) {
 		0, // LR_DEFAULTCOLOR
 	)
 	if h == 0 {
-		return 0, 0, fmt.Errorf("CreateIconFromResourceEx 失败：%w", callErr)
+		return 0, fmt.Errorf("CreateIconFromResourceEx 失败：%w", callErr)
 	}
-	return h, entry.Width, nil
+	return h, nil
 }
 
 // smallIconSize 返回系统当前要求的小图标边长。

@@ -134,18 +134,6 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, publicView(s.engine.Config()))
 	}))
 
-	// 出厂默认配置：设置页的「恢复默认值」按钮拿它填表。
-	//
-	// 默认值只在 Go 这边定义一份（defaultConfig），前端不再抄一遍——
-	// 抄一份就多一个会静默漂移的地方。
-	mux.HandleFunc("/api/defaults", localOnly(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, http.StatusOK, publicView(defaultConfig()))
-	}))
-
 	// 保存配置
 	mux.HandleFunc("/api/config/save", localOnly(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -223,7 +211,7 @@ func (s *Server) Handler() http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "参数解析失败：" + err.Error()})
 			return
 		}
-		if err := TestConnection(cfg); err != nil {
+		if err := TestConnection(cfg, s.log); err != nil {
 			s.log.Errorf("连接测试失败：%v", err)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return

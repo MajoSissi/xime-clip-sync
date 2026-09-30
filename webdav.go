@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 )
@@ -17,6 +18,26 @@ var ErrRateLimited = errors.New("服务器限流（HTTP 503）")
 
 // maxResponseBytes 限制远端文件读取上限，避免异常大文件占满内存。
 const maxResponseBytes = 4 << 20 // 4 MiB
+
+// transferRetryDelay 是传输层出错后立刻重试一次前的等待。
+//
+// 网络抖动（DNS 打嗝、连接被中间设备重置、代理刚重启）通常在几百毫秒内自愈，
+// 而同步节奏是 30 秒一轮——不重试就要白等半分钟。等一下再试，
+// 是为了不把两次尝试打在同一个瞬时故障上。
+const transferRetryDelay = 500 * time.Millisecond
+
+// transportErrIsRetriable 判断传输层错误是否值得立刻重试一次。
+//
+// **超时类错误一律不重试**：重试只会再等一个完整的 Client.Timeout（30 秒），
+// 而这段时间里 syncMu 被占着，连本地剪贴板的推送都跟着停摆。
+// 这条规则也保证了「重试」只给最坏情况增加 500 毫秒，而不是 30 秒。
+func transportErrIsRetriable(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	return true
+}
 
 // webdavClient 是 WebDAV 直连客户端，对齐插件 main.ts 的请求语义：
 //   - Basic Auth（用户名为空时不带 Authorization 头）
@@ -30,12 +51,16 @@ type webdavClient struct {
 	username   string
 	password   string
 	http       *http.Client
+	// log 只用来记「传输层出错、正在重试」这一条；单元测试里可以是 nil。
+	log *LogBuffer
 }
 
-func newWebDAVClient(cfg Config) *webdavClient {
+func newWebDAVClient(cfg Config, log *LogBuffer) *webdavClient {
 	transport := &http.Transport{
 		// 局域网自建 WebDAV 常见自签证书，允许用户显式放宽校验
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+		// 代理策略：nil = 直连，见 proxy.go / proxy_windows.go
+		Proxy: proxyFuncForConfig(cfg),
 	}
 	return &webdavClient{
 		baseURL: cfg.DavURL,
@@ -43,10 +68,18 @@ func newWebDAVClient(cfg Config) *webdavClient {
 		remotePath: cfg.RemotePathOrDefault(),
 		username:   cfg.Username,
 		password:   cfg.Password,
+		log:        log,
 		http: &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
 		},
+	}
+}
+
+// warnf 记一条 warn；没接日志时（单元测试）静默丢弃。
+func (c *webdavClient) warnf(format string, args ...any) {
+	if c.log != nil {
+		c.log.Warnf(format, args...)
 	}
 }
 
@@ -74,23 +107,38 @@ func (c *webdavClient) authHeaders() map[string]string {
 	return h
 }
 
+// request 发送一次请求；传输层出错时立刻重试一次（见 transportErrIsRetriable）。
+//
+// 每次尝试都重建 Request：PUT 的 body 是 bytes.Reader，复用同一个已经发过的
+// Request 会让 body 停在末尾，第二次发出去的就是空内容。
+func (c *webdavClient) request(method, url string, body []byte, extra map[string]string) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequest(method, url, reader)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range c.authHeaders() {
+			req.Header.Set(k, v)
+		}
+		for k, v := range extra {
+			req.Header.Set(k, v)
+		}
+		resp, err := c.http.Do(req)
+		if err == nil || attempt > 0 || !transportErrIsRetriable(err) {
+			return resp, err
+		}
+		c.warnf("%s 失败，%s 后重试一次：%v", method, transferRetryDelay, err)
+		time.Sleep(transferRetryDelay)
+	}
+}
+
 // do 发送一次请求并读空 body。
 func (c *webdavClient) do(method, url string, body []byte, extra map[string]string) (int, http.Header, error) {
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequest(method, url, reader)
-	if err != nil {
-		return 0, nil, err
-	}
-	for k, v := range c.authHeaders() {
-		req.Header.Set(k, v)
-	}
-	for k, v := range extra {
-		req.Header.Set(k, v)
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.request(method, url, body, extra)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -149,17 +197,7 @@ func (c *webdavClient) get(ifNoneMatch string) (body []byte, hdr http.Header, st
 	if ifNoneMatch != "" {
 		headers["If-None-Match"] = ifNoneMatch
 	}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	for k, v := range c.authHeaders() {
-		req.Header.Set(k, v)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.request(http.MethodGet, url, nil, headers)
 	if err != nil {
 		return nil, nil, 0, err
 	}

@@ -38,6 +38,8 @@ build/
   "maxTextChars": 300,
   "manualMaxTextChars": 10000,
   "insecureSkipVerify": false,
+  "proxyMode": "system",
+  "proxyUrl": "",
   "autostart": false,
   "logToFile": true,
   "logRetainDays": 7,
@@ -48,6 +50,22 @@ build/
 
 > 密码不以明文写入：界面填的密码经 Windows DPAPI 加密后存进 `passwordEnc`，换台电脑或换个 Windows
 > 账号都解不开。`config.json` 含密文，不要提交到 Git 或分享给他人。
+
+### 代理
+
+`proxyMode` 有四档，界面上「连接配置」里也有对应的下拉框：
+
+| `proxyMode` | 含义 |
+| --- | --- |
+| `system` | 跟随 Windows 系统代理（「Internet 选项 → 连接 → 局域网设置」），**默认** |
+| `http` | 用 `proxyUrl` 指定的 HTTP 代理 |
+| `socks5` | 用 `proxyUrl` 指定的 SOCKS5 代理 |
+| `none` | 直连，不走任何代理 |
+
+`proxyUrl` 只填 `host:port`（如 `127.0.0.1:7890`），不用写 `http://`。只在 `http` / `socks5` 两档下生效。
+
+系统代理里的「跳过代理」列表（`ProxyOverride`）会照常生效，所以 `127.*`、`192.168.*` 这些局域网地址不会被塞进代理。
+系统代理取的是注册表里的设置，**不读 `HTTP_PROXY` 环境变量**——从资源管理器双击启动的程序拿不到那些变量。
 
 ### 与手机端插件对齐
 

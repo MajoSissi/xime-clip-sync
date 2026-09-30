@@ -44,6 +44,10 @@ type Config struct {
 	LocalPollSeconds int `json:"localPollSeconds"`
 	// 局域网自签证书时放宽 TLS 校验
 	InsecureSkipVerify bool `json:"insecureSkipVerify"`
+	// ProxyMode 决定怎么出网：system（跟随 Windows 系统代理）/ http / socks5 / none。
+	ProxyMode string `json:"proxyMode"`
+	// ProxyURL 是手动代理地址（host:port），只在 ProxyMode 为 http / socks5 时用。
+	ProxyURL string `json:"proxyUrl"`
 	// 自动推送文本长度上限（字符）。本地复制的内容超过这个长度就**自动同步**不推送到远端；
 	// 0 表示不限制。用字符而不是字节，是因为用户看到的是「多少字」。
 	MaxTextChars int `json:"maxTextChars"`
@@ -141,6 +145,9 @@ func defaultConfig() Config {
 		LogRetainDays:      7,
 		LogMaxFileMB:       defaultLogFileMB,
 		UIPort:             defaultUIPort,
+		// 默认跟随系统代理：Windows 桌面程序就是这么被期望的。
+		// 系统没配代理时它等价于直连，所以这个默认值不会凭空改变出网路径。
+		ProxyMode: ProxyModeSystem,
 	}
 }
 
@@ -248,6 +255,13 @@ func (c *Config) normalize() {
 	if c.DeviceName == "" {
 		c.DeviceName = d.DeviceName
 	}
+	// 认不出的代理模式（手改配置、拼错）一律退回「系统代理」。
+	// 空串也走这条——老配置里没有这个字段。
+	c.ProxyMode = strings.TrimSpace(c.ProxyMode)
+	if !validProxyMode(c.ProxyMode) {
+		c.ProxyMode = d.ProxyMode
+	}
+	c.ProxyURL = strings.TrimSpace(c.ProxyURL)
 }
 
 // ---------------------------------------------------------------------------

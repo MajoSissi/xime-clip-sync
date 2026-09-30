@@ -38,7 +38,7 @@ func main() {
 
 	// 必须在创建任何窗口之前声明 DPI 感知：否则在高缩放比的屏幕上，
 	// 系统会按比例拉伸界面，托盘图标会被放大成糊图。
-	dpiMode := enableDPIAwareness()
+	dpiOK := enableDPIAwareness()
 
 	cfgPath := configPath(*cfgFlag)
 
@@ -70,9 +70,8 @@ func main() {
 	for _, w := range cfgWarnings {
 		log.Warnf("%s", w)
 	}
-	if dpiMode != "" {
-		log.Infof("DPI 感知已启用：%s", dpiMode)
-	} else {
+	// 只记失败：成功是常态，逐条播报没有诊断价值；失败才是「图标为什么发虚」的线索。
+	if !dpiOK {
 		log.Warnf("DPI 感知未能启用，托盘图标可能被系统拉伸而发虚")
 	}
 	if cfg.LogToFile {
@@ -90,7 +89,7 @@ func main() {
 
 	// ---- 命令行一次性模式 ----
 	if *doTest {
-		if err := TestConnection(cfg); err != nil {
+		if err := TestConnection(cfg, log); err != nil {
 			fmt.Fprintf(os.Stderr, "连接测试失败：%v\n", err)
 			os.Exit(1)
 		}
@@ -316,7 +315,6 @@ func startTray(ctx context.Context, engine *SyncEngine, cfgPath string, uiStatus
 			}
 		},
 		Tooltip: func() string { return trayTooltip(engine) },
-		Logf:    func(format string, args ...any) { log.Infof(format, args...) },
 	}
 
 	t, err := newTray(cb)

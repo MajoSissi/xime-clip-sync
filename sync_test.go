@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -209,6 +213,10 @@ func testConfig(serverURL string) Config {
 	cfg.RemotePath = "xime/clipboard/current.json"
 	cfg.DeviceName = "test-pc"
 	cfg.Enabled = true
+	// 测试一律直连。默认配置是「跟随系统代理」，照抄的话这套测试就会去读
+	// **开发机自己的注册表**——本机配了系统代理时，指向 127.0.0.1 的 httptest
+	// 请求会被塞进真代理里，测试随机器而红或绿。测试不该依赖开发机的网络设置。
+	cfg.ProxyMode = ProxyModeNone
 	return cfg
 }
 
@@ -323,7 +331,7 @@ func TestWebDAVClientUsesDefaultRemotePath(t *testing.T) {
 	cfg.DavURL = "https://host/dav/"
 	cfg.RemotePath = ""
 
-	got, ok := newWebDAVClient(cfg).fileURL()
+	got, ok := newWebDAVClient(cfg, NewLogBuffer(10)).fileURL()
 	if !ok || got != "https://host/dav/xime/clipboard/current.json" {
 		t.Errorf("webdavClient.fileURL() = (%q, %v)，留空时应落到默认文件", got, ok)
 	}
@@ -531,7 +539,7 @@ func TestBasicAuth(t *testing.T) {
 	cfg := testConfig(srv.URL)
 	cfg.Username = "user"
 	cfg.Password = "pass"
-	client := newWebDAVClient(cfg)
+	client := newWebDAVClient(cfg, NewLogBuffer(10))
 
 	if err := client.testConnection(); err != nil {
 		t.Fatalf("带认证的连接测试失败：%v", err)
@@ -540,7 +548,7 @@ func TestBasicAuth(t *testing.T) {
 	// 错误密码应报认证失败
 	bad := cfg
 	bad.Password = "wrong"
-	if err := newWebDAVClient(bad).testConnection(); err == nil ||
+	if err := newWebDAVClient(bad, NewLogBuffer(10)).testConnection(); err == nil ||
 		!strings.Contains(err.Error(), "认证失败") {
 		t.Errorf("错误密码应返回认证失败，实际：%v", err)
 	}
@@ -1114,3 +1122,146 @@ func TestNoRedundantStartupFetch(t *testing.T) {
 			afterPrime, later)
 	}
 }
+
+// ---------------------------------------------------------------- 传输层重试
+
+// 只有「快速失败」的传输错误才值得立刻重试。
+//
+// 超时类错误必须排除：重试会再等一个完整的 Client.Timeout（30 秒），
+// 而这段时间 syncMu 被占着，连本地剪贴板的推送都跟着停摆。
+func TestTransportErrIsRetriable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			"Client.Timeout 到点（超时类）→ 不重试",
+			&url.Error{Op: "Get", URL: "https://x/dav/", Err: context.DeadlineExceeded},
+			false,
+		},
+		{
+			"连接被对端断开（EOF）→ 重试",
+			&url.Error{Op: "Get", URL: "https://x/dav/", Err: io.EOF},
+			true,
+		},
+		{
+			"DNS 解析失败 → 重试",
+			&url.Error{Op: "Get", URL: "https://x/dav/", Err: &net.DNSError{Err: "no such host", Name: "x"}},
+			true,
+		},
+		{
+			"连接被拒绝 → 重试",
+			&url.Error{Op: "Get", URL: "https://x/dav/", Err: syscall.ECONNREFUSED},
+			true,
+		},
+		{"认不出来的错误按可重试处理", errors.New("boom"), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := transportErrIsRetriable(c.err); got != c.want {
+				t.Errorf("transportErrIsRetriable(%v) = %v，期望 %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// 传输层断连要自动重试一次，且**只重试一次**。
+//
+// 服务端第一次请求直接掐掉连接（制造传输层 EOF，不是 HTTP 错误码），
+// 第二次正常应答。客户端应当自己恢复，用户不该为此白等一个轮询周期。
+func TestTransferErrorRetriesOnce(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		first := hits == 1
+		mu.Unlock()
+
+		if first {
+			// 掐断连接：客户端读到的是 EOF（传输层错误），而不是某个状态码
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, err := hj.Hijack()
+				if err == nil {
+					conn.Close()
+					return
+				}
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL)
+	lb := NewLogBuffer(50)
+	client := newWebDAVClient(cfg, lb)
+
+	status, _, err := client.do(http.MethodGet, srv.URL+"/dav/x.json", nil, nil)
+	if err != nil {
+		t.Fatalf("第一次断连后应当自动重试并成功，实际报错：%v", err)
+	}
+	if status != http.StatusOK {
+		t.Errorf("重试后应拿到 200，实际 %d", status)
+	}
+
+	mu.Lock()
+	got := hits
+	mu.Unlock()
+	if got != 2 {
+		t.Errorf("服务端应被请求 2 次（原请求 + 一次重试），实际 %d 次", got)
+	}
+
+	// 重试这件事必须留痕：否则日志里只有「最终成功了」，看不出中间抖动过。
+	var sawRetry bool
+	for _, l := range lb.Lines(0) {
+		if strings.Contains(l.Text, "重试") {
+			sawRetry = true
+		}
+	}
+	if !sawRetry {
+		t.Errorf("重试没有记日志，实际日志：%+v", lb.Lines(0))
+	}
+}
+
+// 超时类错误不重试：服务端一直不响应时，请求次数必须停在 1。
+//
+// 这条是「重试不会把 30 秒阻塞翻倍」的客观证据。
+func TestTimeoutIsNotRetried(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	release := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		<-release // 挂住不响应，逼客户端超时
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfg := testConfig(srv.URL)
+	client := newWebDAVClient(cfg, NewLogBuffer(50))
+	// 把超时压到很短，测试不用真等 30 秒
+	client.http.Timeout = 150 * time.Millisecond
+
+	start := time.Now()
+	if _, _, err := client.do(http.MethodGet, srv.URL+"/dav/x.json", nil, nil); err == nil {
+		t.Fatal("服务端不响应时应当超时报错")
+	}
+	elapsed := time.Since(start)
+
+	mu.Lock()
+	got := hits
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("超时不该重试，服务端应只被请求 1 次，实际 %d 次（耗时 %v）", got, elapsed)
+	}
+	// 重试一次会多出 500ms 的等待；不重试的话耗时就在超时值附近
+	if elapsed > time.Second {
+		t.Errorf("超时路径耗时 %v，像是又重试了一次", elapsed)
+	}
+}
+

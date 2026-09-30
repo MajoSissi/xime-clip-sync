@@ -248,13 +248,11 @@ func (t *winTray) Run() error {
 	t.hwnd = hwnd
 	t.mu.Unlock()
 
-	icon, iconSize, err := createAppIcon()
+	icon, err := createAppIcon()
 	if err != nil {
 		return err
 	}
 	t.icon = icon
-	t.logf("托盘图标已就绪：%d×%d（系统要求 %d×%d，来自 img/logo.ico）",
-		iconSize, iconSize, smallIconSize(), smallIconSize())
 
 	t.mu.Lock()
 	t.nid = notifyIconDataW{
@@ -378,13 +376,6 @@ func (t *winTray) tooltip() string {
 		return t.cb.Tooltip()
 	}
 	return "Xime Clip Sync"
-}
-
-// logf 记录托盘自身的运行信息（没接日志时静默丢弃）。
-func (t *winTray) logf(format string, args ...any) {
-	if t.cb.Logf != nil {
-		t.cb.Logf(format, args...)
-	}
 }
 
 // openUI 打开配置界面（放在独立 goroutine 里，避免阻塞消息循环）。
