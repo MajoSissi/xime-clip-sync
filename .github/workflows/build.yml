@@ -1,0 +1,104 @@
+name: build
+
+# 只手动触发：仓库 Actions 页面 → build → Run workflow。
+#
+# 刻意不挂 push / pull_request —— 构建什么时候跑由人决定，推代码不会自己动 CI。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v1.4.0）。留空 = 只构建，不发 Release。"
+        required: false
+        default: ""
+        type: string
+
+# 手动跑的构建不互相取消：一次正在发 Release，别被后点的第二次掐掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows / amd64
+    runs-on: windows-latest
+    permissions:
+      contents: write # 发 Release 需要（tag 留空时用不到，但同一 job 里统一给）
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gh release --generate-notes 要完整提交历史
+
+      # 跑**最低支持版本**，而不是本机那个新的。
+      # 两者在 net/http 上并不等价：ServeMux 对不干净路径的跳转状态码
+      # 1.23~1.25 是 301、1.26 起是 307，而 http.Client 跟随 301 会把 POST 降级成 GET。
+      # 本机（1.27）绿不代表这里绿——这个版本差真红过一次（见 DEVELOPMENT.md）。
+      - name: 安装 Go（最低支持版本）
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: 显示 Go 版本
+        run: go version
+
+      # -short 跳过真的读写剪贴板 / 改注册表的用例：CI 跑在无交互会话里，跑不了。
+      - name: 运行测试
+        run: go test ./... -short
+
+      # genico.go 从 main.go 里解析版本号写进 exe 的版本资源，
+      # 所以要发布的 tag 和源码里的 version 必须一致，否则会发出一个版本号对不上的包。
+      - name: 校验 tag 与源码版本号一致
+        if: inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          src=$(grep -oP 'const version = "\K[0-9.]+' main.go)
+          want="${TAG#v}"
+          echo "main.go: $src / tag: $TAG"
+          if [ "$src" != "$want" ]; then
+            echo "::error::tag ${TAG} 与 main.go 里的 version (${src}) 不一致，请先改 main.go"
+            exit 1
+          fi
+
+      - name: 生成图标资源
+        run: go run genico.go icon.go
+
+      - name: 构建 exe
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags "-s -w -H=windowsgui" -o build/xime-clip-sync.exe .
+          ls -lh build/xime-clip-sync.exe
+
+      - name: 生成校验和
+        working-directory: build
+        run: sha256sum xime-clip-sync.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xime-clip-sync-windows-amd64
+          path: |
+            build/xime-clip-sync.exe
+            build/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 发布 Release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            build/xime-clip-sync.exe \
+            build/SHA256SUMS.txt \
+            --title "Xime Clip Sync $TAG" \
+            --generate-notes

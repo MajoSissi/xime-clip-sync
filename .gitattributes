@@ -1,0 +1,16 @@
+# 换行符统一用 LF，尤其别让 Windows 上的 core.autocrlf 把 \r 塞进脚本里。
+# bash 脚本带 CRLF 会直接报 `syntax error near unexpected token $'\r'`，
+# 构建脚本和工作流里的 run 都是 bash，必须干净。
+
+* text=auto
+
+*.sh   text eol=lf
+*.bash text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.go   text eol=lf
+
+# 批处理反而习惯 CRLF，但保持原样即可，不做强制。
+*.bat  text
+*.ico  binary
+*.png  binary
