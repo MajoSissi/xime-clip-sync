@@ -48,6 +48,207 @@ func TestTrayWindowClassHasDblClks(t *testing.T) {
 	}
 }
 
+// 托盘图标不是进程画的，是外壳（explorer.exe）那里的登记：外壳一重建任务栏
+// （重启 explorer、从睡眠唤醒、缩放变化），图标就全没了，而进程这边收不到任何错误。
+// 所以这两类消息必须被认出来，否则表现就是「图标没了、程序还在跑」。
+func TestTrayWindowAction(t *testing.T) {
+	// 真实编号是运行期用 RegisterWindowMessageW 换出来的，测试里随便挑个非零值。
+	const taskbarCreated = 0xC123
+
+	cases := []struct {
+		name   string
+		msg    uint32
+		wparam uint32
+		want   trayMsgAction
+	}{
+		{"外壳广播「任务栏已重建」", taskbarCreated, 0, trayMsgRestoreIcon},
+		{"系统自动唤醒", wmPowerBroadcast, pbtApmResumeAutomatic, trayMsgRestoreIcon},
+		{"用户操作唤醒", wmPowerBroadcast, pbtApmResumeSuspend, trayMsgRestoreIcon},
+		// 下面这些都不能误判：误判的代价是图标被删掉又加回来（闪一下、任务栏里顺序也乱）
+		{"挂起前的询问不是唤醒", wmPowerBroadcast, 0x0000 /* PBT_APMQUERYSUSPEND */, trayMsgNone},
+		{"真正进入挂起不是唤醒", wmPowerBroadcast, 0x0004 /* PBT_APMSUSPEND */, trayMsgNone},
+		{"托盘鼠标消息", wmTrayCallback, 0, trayMsgNone},
+		{"菜单命令", wmCommand, 0, trayMsgNone},
+		{"窗口销毁", wmDestroy, 0, trayMsgNone},
+	}
+	for _, c := range cases {
+		if got := trayWindowAction(c.msg, c.wparam, taskbarCreated); got != c.want {
+			t.Errorf("%s：trayWindowAction(%#x, %#x) = %d，期望 %d",
+				c.name, c.msg, c.wparam, got, c.want)
+		}
+	}
+
+	// 消息号没换到（注册失败）时一律不认：0 就是 WM_NULL，消息循环里到处都是，
+	// 把它当成 TaskbarCreated 会变成「每收到一条空消息就把图标删了重加」。
+	if got := trayWindowAction(0, 0, 0); got != trayMsgNone {
+		t.Errorf("消息号注册失败（0）时不该把 0 号消息当成 TaskbarCreated，得到 %d", got)
+	}
+}
+
+// 认出信号之后必须真的去补一次图标，并且留下日志。
+//
+// 日志是这里唯一能被观察到的结果：图标补回来了就等于「什么都没发生过」，
+// 事后翻日志时「外壳丢过图标」这条线索不能缺。
+func TestTrayRestoresIconOnShellRebuild(t *testing.T) {
+	const taskbarCreated = 0xC123
+	var adds int
+	var logs []string
+	tr := &winTray{
+		cb: &trayCallbacks{
+			Log:  func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+			Warn: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+		},
+		taskbarCreatedMsg: taskbarCreated,
+		reAdd:             func() error { adds++; return nil },
+	}
+
+	// 普通消息不许触发补救（否则每次点菜单都会把图标删了又加）
+	if tr.handleWindowMessage(wmCommand, 0) {
+		t.Error("WM_COMMAND 被当成了图标补救信号")
+	}
+	if tr.handleWindowMessage(wmPowerBroadcast, 0x0004 /* PBT_APMSUSPEND */) {
+		t.Error("进入挂起被当成了图标补救信号")
+	}
+	if adds != 0 {
+		t.Fatalf("普通消息触发了 %d 次补图标", adds)
+	}
+
+	for _, m := range []struct {
+		name   string
+		msg    uint32
+		wparam uint32
+	}{
+		{"任务栏重建", taskbarCreated, 0},
+		{"唤醒恢复", wmPowerBroadcast, pbtApmResumeAutomatic},
+	} {
+		if !tr.handleWindowMessage(m.msg, m.wparam) {
+			t.Errorf("%s：消息没有被消化", m.name)
+		}
+	}
+	if adds != 2 {
+		t.Errorf("补图标次数 = %d，期望 2", adds)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("日志条数 = %d，期望 2：%v", len(logs), logs)
+	}
+	for _, s := range logs {
+		if strings.TrimSpace(s) == "" {
+			t.Error("补图标留了一条空日志")
+		}
+		if !strings.Contains(s, "托盘图标") {
+			t.Errorf("日志 %q 里看不出是在说托盘图标", s)
+		}
+	}
+}
+
+// 补图标失败必须留痕，而且要带上原因：外壳刚重建那一瞬间 NIM_ADD 可能还失败，
+// 静默的话「图标还是没回来」就成了无头案。
+func TestTrayRestoreFailureIsLoggedAsWarning(t *testing.T) {
+	const taskbarCreated = 0xC123
+	var warns []string
+	tr := &winTray{
+		cb:                &trayCallbacks{Warn: func(f string, a ...any) { warns = append(warns, fmt.Sprintf(f, a...)) }},
+		taskbarCreatedMsg: taskbarCreated,
+		reAdd:             func() error { return errors.New("外壳还没准备好") },
+	}
+
+	tr.handleWindowMessage(taskbarCreated, 0)
+
+	if len(warns) != 1 {
+		t.Fatalf("失败时记了 %d 条 warn，期望 1 条：%v", len(warns), warns)
+	}
+	if !strings.Contains(warns[0], "外壳还没准备好") {
+		t.Errorf("warn=%q 里没有失败原因", warns[0])
+	}
+}
+
+// 没接任何回调时不许 panic：托盘可以在没有日志的情况下单独用（自检、测试）。
+func TestTrayRestoreWorksWithoutCallbacks(t *testing.T) {
+	var adds int
+	for _, tr := range []*winTray{
+		{}, // cb 为 nil，reAdd 也为 nil
+		{cb: &trayCallbacks{}, reAdd: func() error { adds++; return nil }},
+	} {
+		tr.taskbarCreatedMsg = 0xC123
+		tr.handleWindowMessage(0xC123, 0)
+	}
+	if adds != 1 {
+		t.Errorf("接了 reAdd 的那次没被调用（adds=%d）", adds)
+	}
+}
+
+// 真广播一次「任务栏已重建」，验证隐藏窗口**确实收得到**这条广播。
+//
+// 上面几条测的是「收到消息之后怎么办」，这条测的是另一个前提：外壳广播时我们收不收得到。
+// 它依赖隐藏窗口是个**顶层**窗口（CreateWindowExW 的父窗口传 0）——哪天有人把关掉的
+// 父窗口改成 HWND_MESSAGE（消息专用窗口），广播就再也送不到，图标丢了永远补不回来，
+// 而上面那些单测会照样全绿。这条是唯一能挡住那种改动的测试。
+//
+// -short 跳过：它要真的建窗口、加托盘图标，跑起来任务栏里会闪一下图标。
+func TestTrayReceivesTaskbarCreatedBroadcast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("-short：要用真窗口收真广播，跳过")
+	}
+	msg := registerTaskbarCreated()
+	if msg == 0 {
+		t.Skip("本机换不到 TaskbarCreated 消息号，跳过")
+	}
+
+	restored := make(chan struct{}, 4)
+	runErr := make(chan error, 1)
+	tr := &winTray{cb: &trayCallbacks{}}
+	tr.notify = tr.Balloon
+	// 只验分发，把「补图标」换成假的：这条测的是消息到没到，
+	// 真的去动托盘图标只会让任务栏闪，验不出更多东西。
+	tr.reAdd = func() error { restored <- struct{}{}; return nil }
+
+	go func() { runErr <- tr.Run() }()
+	t.Cleanup(tr.Stop)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for tr.window() == 0 {
+		if time.Now().After(deadline) {
+			t.Skipf("这台机器上建不出托盘窗口（多半没有交互桌面），跳过：%v", <-runErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 跟外壳的做法一样：往所有顶层窗口广播这两条消息。
+	// 唤醒那条也是真广播——系统从睡眠里醒过来时就是这么发的。
+	for _, b := range []struct {
+		name      string
+		msg       uintptr
+		wparam    uintptr
+		mayRefuse bool
+	}{
+		{"TaskbarCreated", uintptr(msg), 0, false},
+		{"WM_POWERBROADCAST + 唤醒", wmPowerBroadcast, pbtApmResumeAutomatic, true},
+	} {
+		r, _, err := procPostMessageW.Call(0xFFFF /* HWND_BROADCAST */, b.msg, b.wparam, 0)
+		if r == 0 {
+			// 系统消息（小于 WM_USER）不允许由进程广播，我这么伪造一下可能被挡住。
+			// 挡住的只是「测试自己假装唤醒」，不影响要接的那条路径（系统自己发得出去）。
+			if b.mayRefuse {
+				t.Logf("%s 不允许由进程广播（%v），跳过这一条", b.name, err)
+				continue
+			}
+			t.Fatalf("广播 %s 失败：%v", b.name, err)
+		}
+
+		select {
+		case <-restored:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("广播 %s 之后托盘没去补图标：隐藏窗口收不到广播（是不是变成消息专用窗口了？）", b.name)
+		}
+
+		// 收到广播之后才读这个字段：Run 写它、这里读它，中间隔着上面那次通道收发，
+		// 有明确的前后关系（放在循环前面读就是实打实的数据竞争）。
+		if tr.taskbarCreatedMsg != msg {
+			t.Errorf("Run 里注册的消息号 = %#x，期望 %#x", tr.taskbarCreatedMsg, msg)
+		}
+	}
+}
+
 // 右键菜单从上到下必须是：
 //
 //	同步中 🔄                ← 状态行（灰色不可点）

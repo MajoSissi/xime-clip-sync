@@ -32,6 +32,9 @@ var (
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
 
+	// 「外壳重建了任务栏」这条消息没有固定编号，只能用一个约定的名字换出来。
+	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
+
 	shell32              = syscall.NewLazyDLL("shell32.dll")
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 )
@@ -46,6 +49,11 @@ const (
 	wmRButtonUp     = 0x0205
 	wmApp           = 0x8000
 	wmTrayCallback  = wmApp + 1
+
+	// 电源事件广播（挂起前询问 / 唤醒等），wParam 说明是哪种事件。
+	wmPowerBroadcast      = 0x0218
+	pbtApmResumeAutomatic = 0x0012 // 系统自动唤醒（定时器等）
+	pbtApmResumeSuspend   = 0x0007 // 用户操作唤醒
 
 	// 窗口类风格：只有带 CS_DBLCLKS，系统才会把「快速两次按下」合成
 	// WM_LBUTTONDBLCLK 发过来；否则只会收到两次 WM_LBUTTONUP。
@@ -137,16 +145,39 @@ type winTray struct {
 	nid  notifyIconDataW
 	mu   sync.Mutex
 
+	// taskbarCreatedMsg 是外壳那条「任务栏已重建」广播的消息号
+	// （RegisterWindowMessageW 换出来的，0 表示没换到）。Run 里写一次，之后只读。
+	taskbarCreatedMsg uint32
+
 	// notify 弹气泡的实现，默认是 Balloon（真 Shell_NotifyIconW）。
 	// 留这个字段是为了让「打开配置界面失败时会弹气泡」这条行为可测——
 	// 气泡本身要真窗口，测试里既弹不出来也看不见。
 	notify func(title, text string)
+
+	// reAdd 是「重新把图标交给外壳」的实现，默认是 shellReAddIcon。
+	// 留这个字段的理由和 notify 一样：测试里既加不了真图标，
+	// 也不好断言「外壳丢了图标之后确实补了一次」，把动作换成假的才测得到。
+	reAdd func() error
 }
 
 func newTray(cb *trayCallbacks) (trayApp, error) {
 	t := &winTray{cb: cb}
 	t.notify = t.Balloon
+	t.reAdd = t.shellReAddIcon
 	return t, nil
+}
+
+// logf / warnf 记一条托盘自己的日志（没接回调时静默忽略）。
+func (t *winTray) logf(format string, args ...any) {
+	if t.cb != nil && t.cb.Log != nil {
+		t.cb.Log(format, args...)
+	}
+}
+
+func (t *winTray) warnf(format string, args ...any) {
+	if t.cb != nil && t.cb.Warn != nil {
+		t.cb.Warn(format, args...)
+	}
 }
 
 // trayClick 是托盘图标上的鼠标动作。
@@ -187,6 +218,95 @@ func trayWindowClass(hInst uintptr, className *uint16, proc uintptr) wndClassExW
 	}
 }
 
+// trayMsgAction 是一条窗口消息该引起的动作。
+type trayMsgAction int
+
+const (
+	trayMsgNone trayMsgAction = iota
+	// trayMsgRestoreIcon：图标可能被外壳丢掉了，重新交一次。
+	trayMsgRestoreIcon
+)
+
+// trayWindowAction 判断一条窗口消息是不是「外壳把托盘图标丢了」的信号。
+//
+// **托盘图标不是进程画出来的，是外壳（explorer.exe）那里的一份登记。** 外壳只要重建了
+// 任务栏——重启 explorer、从睡眠/休眠里醒过来、分辨率或缩放变化后重建——就会把所有
+// 第三方图标一起丢掉，而**进程这边收不到任何错误**：Shell_NotifyIcon 不报错，消息循环
+// 也没有异常。表现就是「托盘图标没了，但程序还在跑」，用户只能重启程序才找得回来。
+//
+// 两个信号都要接：
+//
+//   - TaskbarCreated：外壳重建完任务栏后广播的消息（编号由 RegisterWindowMessageW 换来，
+//     同一个名字在所有进程里换到同一个编号，所以对得上）。
+//   - WM_POWERBROADCAST + 唤醒事件：唤醒这一瞬间外壳往往正在重建任务栏，
+//     而那条 TaskbarCreated 很可能**在我们被挂起的时候就广播过了**，只等它一定会漏。
+//
+// taskbarCreated 为 0（注册失败）时一律不认：0 就是 WM_NULL，消息循环里到处都是，
+// 误判会变成「图标删了又加」没完没了。
+func trayWindowAction(msg, wparam, taskbarCreated uint32) trayMsgAction {
+	if taskbarCreated != 0 && msg == taskbarCreated {
+		return trayMsgRestoreIcon
+	}
+	if msg == wmPowerBroadcast && (wparam == pbtApmResumeAutomatic || wparam == pbtApmResumeSuspend) {
+		return trayMsgRestoreIcon
+	}
+	return trayMsgNone
+}
+
+// registerTaskbarCreated 换出「任务栏已重建」那条广播的消息号（0 表示没换到）。
+func registerTaskbarCreated() uint32 {
+	name := utf16Ptr("TaskbarCreated")
+	if name == nil {
+		return 0
+	}
+	r, _, _ := procRegisterWindowMessageW.Call(uintptr(unsafe.Pointer(name)))
+	return uint32(r)
+}
+
+// handleWindowMessage 处理那些「图标可能被外壳丢了」的消息，返回 true 表示已消化。
+func (t *winTray) handleWindowMessage(msg, wparam uint32) bool {
+	if trayWindowAction(msg, wparam, t.taskbarCreatedMsg) != trayMsgRestoreIcon {
+		return false
+	}
+	t.reAddIcon()
+	return true
+}
+
+// reAddIcon 重新把图标交给外壳，并把结果记进日志。
+//
+// 记日志是刻意的：补图标这件事用户看不见（补上了就等于「什么都没发生过」），
+// 但**日志里必须留痕**——否则「托盘图标偶尔消失」到底是外壳丢的、还是压根没加上，
+// 事后完全没法判断。
+func (t *winTray) reAddIcon() {
+	if t.reAdd == nil {
+		return
+	}
+	if err := t.reAdd(); err != nil {
+		t.warnf("系统重建了任务栏，托盘图标重新添加失败：%v", err)
+		return
+	}
+	t.logf("系统重建了任务栏，已重新添加托盘图标")
+}
+
+// shellReAddIcon 是 reAdd 的默认实现。
+//
+// 先 NIM_DELETE 再 NIM_ADD：外壳是按 (hWnd, uID) 认这份登记的，图标还在时直接
+// NIM_ADD 不保证会替换（文档没有承诺），先删一次才能保证「加」真的生效。
+// 删一个不存在的图标是无害的，失败也不当错误。
+func (t *winTray) shellReAddIcon() error {
+	t.mu.Lock()
+	nid := t.nid
+	t.mu.Unlock()
+	if nid.hWnd == 0 {
+		return nil // 还没启动完，没有图标要补
+	}
+	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+	if r, _, err := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid))); r == 0 {
+		return fmt.Errorf("Shell_NotifyIconW 添加图标失败：%w", err)
+	}
+	return nil
+}
+
 // trayWndProc 处理托盘窗口消息。
 func trayWndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	trayInstanceMu.Lock()
@@ -196,6 +316,12 @@ func trayWndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	if t == nil {
 		r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
 		return r
+	}
+
+	// 先判「要不要补图标」：TaskbarCreated 的消息号是运行期才拿到的，
+	// 写不进下面的 switch，只能在这里对一次。
+	if t.handleWindowMessage(uint32(msg), uint32(wparam)) {
+		return 0
 	}
 
 	switch msg {
@@ -247,6 +373,14 @@ func (t *winTray) Run() error {
 	t.mu.Lock()
 	t.hwnd = hwnd
 	t.mu.Unlock()
+
+	// 换出「任务栏已重建」的广播消息号，收到就补一次图标（见 trayWindowAction）。
+	// 换不到只是「外壳重建后图标回不来」，不该让整个托盘起不来，所以只记一条 warn。
+	if m := registerTaskbarCreated(); m != 0 {
+		t.taskbarCreatedMsg = m
+	} else {
+		t.warnf("注册 TaskbarCreated 消息失败，外壳重建任务栏后托盘图标没法自动恢复")
+	}
 
 	icon, err := createAppIcon()
 	if err != nil {

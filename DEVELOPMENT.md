@@ -261,6 +261,38 @@ SetProcessDPIAware()                                  Vista+
 `CNT_INITIALIZED_DATA | MEM_READ`（带 `MEM_DISCARDABLE` 会被链接器整个跳过，产出没有图标的 exe）；
 资源目录里的偏移是 RVA，每处都要生成重定位。两条都有测试盯着。
 
+### 托盘图标为什么会自己消失（以及怎么补回来）
+
+**托盘图标不是进程画出来的，是外壳（explorer.exe）那里的一份登记。** 外壳只要重建了任务栏——
+重启 explorer、从睡眠/休眠里醒过来、分辨率或缩放变化后重建——就会把所有第三方图标一起丢掉。
+
+关键在于**进程这边收不到任何错误**：`Shell_NotifyIcon` 不报错，消息循环也没有异常，程序里没有任何
+东西能「察觉图标没了」。表现出来就是**图标消失了、但程序明明还在跑**（日志在写、同步照做、双击托盘
+的位置没有反应），用户只能重启程序才找得回图标。
+
+唯一能做的是**接住外壳的通知，然后重新登记一次**。两个信号都要接（`trayWindowAction`）：
+
+| 信号 | 什么时候来 | 只接另一个会漏的情况 |
+|------|-----------|--------------------|
+| `TaskbarCreated`（`RegisterWindowMessageW` 换出的消息号） | 外壳重建完任务栏后广播 | 唤醒那一瞬间外壳正在重建，这条**很可能在我们被挂起时就广播过了** |
+| `WM_POWERBROADCAST` + `PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND` | 系统从睡眠/休眠里醒过来 | 外壳没重建任务栏、但把图标弄丢了的场合 |
+
+补的方式是 `NIM_DELETE` → `NIM_ADD`：外壳按 `(hWnd, uID)` 认这份登记，图标还在时直接 `NIM_ADD`
+**不保证**会替换（文档没有承诺），先删一次才能保证「加」真的生效。删一个不存在的图标是无害的。
+
+几个刻意的决定：
+
+- **消息号注册失败（`0`）时一律不认**。`0` 就是 `WM_NULL`，消息循环里到处都是；把 `0` 当
+  `TaskbarCreated` 会变成「每收到一条空消息就把图标删了又加」，任务栏里图标一直闪。见
+  `TestTrayWindowAction` 里那条反向哨兵。
+- **补图标必须留日志**（`已重新添加托盘图标` / 失败时带原因）。补成功这件事用户看不见——
+  图标回来了就等于「什么都没发生过」，事后只能靠日志判断「图标偶尔消失」到底是外壳丢的、
+  还是压根没加上。日志回调走 `trayCallbacks.Log` / `Warn`（托盘在后台，得让它自己记得了）。
+- **注册失败只记一条 warn，不让托盘起不来**：只是一项自愈能力没了，不该连图标都没有。
+- **隐藏窗口必须是顶层窗口**（`CreateWindowExW` 的父窗口传 `0`）。消息专用窗口（`HWND_MESSAGE`）
+  **收不到广播**，那样上面这些全白搭。`TestTrayReceivesTaskbarCreatedBroadcast` 真的广播一次
+  `TaskbarCreated` 来钉住这条前提——它依赖真窗口，所以 `-short` 会跳过。
+
 ---
 
 ## 九、文件结构
@@ -277,7 +309,7 @@ xime-clip-sync/
 ├── clipboard.go            剪贴板接口定义
 ├── clipboard_windows.go    Windows：直接调用 user32/kernel32
 ├── tray.go                 托盘接口与菜单动作定义
-├── tray_windows.go         Windows 托盘（Shell_NotifyIconW + 隐藏消息窗口 + 气泡 + 鼠标手势）
+├── tray_windows.go         Windows 托盘（Shell_NotifyIconW + 隐藏消息窗口 + 气泡 + 鼠标手势 + 外壳重建后补图标）
 ├── dpi_windows.go          声明进程 DPI 感知（托盘图标 1:1 绘制的前提）
 ├── icon.go                 内嵌 img/logo.ico + ICO 解析（运行期托盘图标用）
 ├── icon_windows.go         从 ICO 帧生成 HICON（CreateIconFromResourceEx）
@@ -307,8 +339,8 @@ xime-clip-sync/
 ## 十、测试
 
 ```bash
-go test ./...          # 全部 107 个
-go test ./... -short   # 跳过会改动真实剪贴板/注册表的测试
+go test ./...          # 全部 109 个
+go test ./... -short   # 跳过会动真实剪贴板 / 注册表 / 真窗口的测试
 ```
 
 用 `httptest` 起了模拟 WebDAV 服务器，覆盖 URL 组装、wire 字段格式、纯文本兼容、目录自动创建、
@@ -346,6 +378,8 @@ Basic Auth、本地→远端、远端→本地、回声抑制、ETag 304、503 �
 | 配置固定在 exe 目录 | `TestConfigPathIsExeDir` |
 | 启动不重复拉取 | `TestNoRedundantStartupFetch` |
 | 托盘单击无响应、双击开界面 | `TestTrayClickAction`、`TestTrayWindowClassHasDblClks` |
+| 外壳重建任务栏 / 睡眠唤醒后补回图标（两类信号都认，消息号注册失败时不认 `0` 号消息） | `TestTrayWindowAction`、`TestTrayRestoresIconOnShellRebuild`、`TestTrayRestoreFailureIsLoggedAsWarning`、`TestTrayRestoreWorksWithoutCallbacks` |
+| 隐藏窗口**真的**收得到外壳广播（必须是顶层窗口，不能是消息专用窗口） | `TestTrayReceivesTaskbarCreatedBroadcast`（`-short` 跳过，要真窗口） |
 | 托盘菜单排版与文案（顶部一行状态 + 两条分隔线、无同步开关项） | `TestTrayMenuLayoutOrder`、`TestTrayMenuStatusItemsOnTop`、`TestTrayMenuIDsAreDistinct`、`TestTrayMenuHasNoToggleItem`、`TestTrayMenuLabels` |
 | 菜单状态行取自当前状态、不写死 | `TestTrayMenuStatusSource` |
 | 状态行只做二选一（正常 / 异常） | `TestTrayMenuSyncLabel` |

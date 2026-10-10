@@ -315,6 +315,8 @@ func startTray(ctx context.Context, engine *SyncEngine, cfgPath string, uiStatus
 			}
 		},
 		Tooltip: func() string { return trayTooltip(engine) },
+		Log:     log.Infof,
+		Warn:    log.Warnf,
 	}
 
 	t, err := newTray(cb)

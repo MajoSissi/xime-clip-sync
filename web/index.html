@@ -80,10 +80,15 @@
   .page.active { display: grid; }
   /* 同步设置 / 程序设置：两张等宽卡片 */
   .page.sync, .page.app { grid-template-columns: repeat(2, minmax(320px, 1fr)); }
+  /* 程序设置有三张卡片：让「启动与日志」占两行，右列就能落下另外两张。
+     否则第三个卡片会孤零零占掉第二行的左半格、右半格空着。 */
+  .page.app > section.tall { grid-row: span 2; align-self: stretch; }
   /* 运行状态：左边状态卡片收窄，把宽度让给日志（日志行又长又多） */
   .page.status { grid-template-columns: minmax(340px, 460px) minmax(0, 1fr); }
   @media (max-width: 1020px) {
     .page.sync, .page.app, .page.status { grid-template-columns: minmax(0, 1fr); }
+    /* 单列时取消跨行：跨行是给两列布局用的，单列下只会凭空空出一块 */
+    .page.app > section.tall { grid-row: auto; }
   }
 
   section {
@@ -260,9 +265,7 @@
           <label for="remotePath">远程路径</label>
           <input type="text" id="remotePath" placeholder="xime/clipboard/current.json">
           <div class="help">
-            远端文件路径，相对服务器地址，要具体到文件，如 <code>rime/clip/1.json</code>。
-            留空即 <code>xime/clipboard/current.json</code>；要和手机端插件指向同一文件，
-            就填「插件里那个远程目录 + <code>/clipboard/current.json</code>」。
+            远端文件路径，具体到文件，留空则为「xime/clipboard/current.json」
           </div>
         </div>
         <div class="row">
@@ -283,22 +286,6 @@
           <input type="checkbox" id="insecureSkipVerify">
           <span class="lbl">跳过 TLS 证书校验</span>
         </label>
-        <div class="row">
-          <div class="field">
-            <label for="proxyMode">代理</label>
-            <select id="proxyMode">
-              <option value="system">系统代理</option>
-              <option value="http">HTTP 代理</option>
-              <option value="socks5">SOCKS5 代理</option>
-              <option value="none">不代理</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="proxyUrl">代理地址</label>
-            <input type="text" id="proxyUrl" placeholder="127.0.0.1:7890"
-                   title="只填 host:port，不用写 http:// 或 socks5://；选「系统代理」「不代理」时这一项不生效">
-          </div>
-        </div>
       </div>
       <div class="card-actions">
         <button id="btnTest">测试连接</button>
@@ -379,10 +366,10 @@
 
   </div>
 
-  <!-- ============ 页三：程序设置（启动与日志 + 配置界面） ============ -->
+  <!-- ======== 页三：程序设置（启动与日志 + 配置界面 + 网络代理） ======== -->
   <div class="page app" id="page-app">
 
-    <section>
+    <section class="tall">
       <h2>启动与日志</h2>
       <div class="fields">
         <div class="checks">
@@ -416,6 +403,35 @@
           <input type="number" id="uiPort" min="1" max="65535" title="保存后立即生效；新端口被占用时会提示你改配置文件再重启">
           <div class="help">当前地址：<a id="uiUrl" href="/"></a></div>
         </div>
+      </div>
+    </section>
+
+    <!-- 代理放在「程序设置」里，不放「连接配置」：它管的是程序**怎么出网**，
+         跟服务器地址/账号密码不是一类东西；而且多数人用默认的「系统代理」就够了，
+         摆在连接配置里会和必填项混在一起，看起来像「还得再填一项才能用」。 -->
+    <section>
+      <h2>网络代理</h2>
+      <div class="fields">
+        <div class="row">
+          <div class="field">
+            <label for="proxyMode">代理</label>
+            <select id="proxyMode">
+              <option value="system">系统代理</option>
+              <option value="http">HTTP 代理</option>
+              <option value="socks5">SOCKS5 代理</option>
+              <option value="none">不代理</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="proxyUrl">代理地址</label>
+            <input type="text" id="proxyUrl" placeholder="127.0.0.1:7890"
+                   title="只填 host:port，不用写 http:// 或 socks5://；选「系统代理」「不代理」时这一项不生效">
+          </div>
+        </div>
+      </div>
+      <div class="help">
+        只影响本程序访问 WebDAV 服务器的流量。「系统代理」读的是 Windows 的
+        「Internet 选项 → 连接 → 局域网设置」，改完系统设置后这里不用再动。
       </div>
     </section>
 

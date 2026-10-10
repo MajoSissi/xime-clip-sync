@@ -71,6 +71,12 @@ type trayCallbacks struct {
 	Tooltip func() string
 	// MenuStatus 返回右键菜单顶部的状态文字。
 	MenuStatus func() trayMenuStatus
+	// Log / Warn 让托盘自己记日志。
+	//
+	// 托盘在后台运行，用户看不到它的内部状态：图标被外壳丢掉又补回来这种事，
+	// 界面上和气泡里都不该出现（补上了就等于没发生），只能靠日志回溯。
+	Log  func(format string, args ...any)
+	Warn func(format string, args ...any)
 }
 
 // trayApp 是系统托盘图标。
