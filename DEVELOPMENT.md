@@ -22,9 +22,9 @@ go build -ldflags "-s -w -H=windowsgui" -o build/xime-clip-sync.exe
 
 ⚠️ **别在项目根跑 `go build ./...`**——会吐一个不带 `-s -w` 的 exe。日常检查用 `go vet ./...` / `go test ./...`。
 
-当前产物：`build/xime-clip-sync.exe`，v1.5.0，仅 Windows/amd64，9,176,064 字节（v1.4.0 起引入
+当前产物：`build/xime-clip-sync.exe`，v1.5.0，仅 Windows/amd64，9,228,288 字节（v1.4.0 起引入
 `image/png` 等标准库包做图片编解码，比只同步文本的 v1.3.0 大约 +0.6 MB；v1.5.0 只是配置、
-目录准备、错误信息与日志分通道上的调整，体积基本没变）。
+目录准备、错误信息、日志分通道与「运行状态」页的调整，体积基本没变）。
 
 **换图标只需替换 `img/logo.ico` 后重新构建**，不用改任何代码。
 
@@ -224,7 +224,13 @@ GOTOOLCHAIN=go1.23.12 go test ./... -short   # 用 CI 那个版本本地验一�
 | `currentKind` | 当前一致的是哪一种：`""` / `text` / `image` |
 | `currentImageHash` | 一致的那张图的**内容哈希**（对下载/上传的 PNG 字节算 SHA-256） |
 | `currentImageSize` | 那张图的字节数（界面显示体积用） |
+| `currentImagePNG` | 那张图的 PNG 字节，**只为了界面能把图画出来**（见 `/api/image`） |
 | `remoteKind` / `remoteImageSize` | 远端那边是什么（界面展示 + 判断要不要下附件） |
+| `remoteImagePNG` / `remoteImageHash` | 远端那张图的字节与它**本地算的**哈希；只有真拿到字节后才有值 |
+
+`Status` 里对应暴露 `currentImageHash` / `remoteImageHash`（界面取原图的内容地址）与
+`currentTextChars` / `remoteTextChars`（**未截断**的字符数）。字符数不能由 `currentText` 反推——
+那是 150 字符的摘要，1000 字的文本会显示成 151，数字看着合理但是错的。
 
 几条刻意的决定：
 
@@ -275,6 +281,28 @@ GOTOOLCHAIN=go1.23.12 go test ./... -short   # 用 CI 那个版本本地验一�
 
 `openClipboard` / `closeClipboard` 必须严格配对（一律 `defer closeClipboard()`）：
 漏一次释放就是把剪贴板永久锁死，比慢一点严重得多。
+
+### 界面怎么把图片画出来（`/api/image`）
+
+「运行状态」页的「本地内容 / 远端内容」两块直接把图画出来，右上角靠右给出规模
+（文本按**字符**、图片按**体积**）。图片走 `GET /api/image?side=local|remote&h=<sha256>`：
+
+- **按内容寻址**。URL 里带的是引擎自己算的 SHA-256。同一张图 URL 不变，所以可以
+  `immutable` 长缓存；图换了 URL 就换，界面不会画出一张已经过期的图。
+  前端 `setShot` 只在 `h` 变化时才重设 `img.src`——status 每 2 秒推一次，
+  无脑重设会让浏览器反复请求同一张图并闪一下。
+- **取不到就 404**，界面退回「只显示体积 +（未取到原图）」。
+  引擎只在**确实已经拿到字节**时给得出图（推送过、拉取过、或启动时读过剪贴板）。
+  刻意**不**为了画一张图去现读剪贴板（会重新引入上面那个抢剪贴板的 bug），
+  也**不**去现下附件（一个界面请求不该触发网络 IO）。
+- 远端从图片变回文本、或只拿到元数据时，手里留的那份字节会被丢掉
+  （`TestRemoteImageBytesDroppedWhenRemoteBecomesText`）——否则界面会把上一张图
+  继续画在「远端内容」里，而远端此刻根本不是那张图。
+- 卡片只有 300 多像素宽（`.page.status` 左列 `minmax(340px, 460px)`），缩略图看不清，
+  所以图片可点：点一下开原尺寸 PNG（`/api/image` 返回的就是原图）。
+- CSS 上两个细节容易踩：`max-width: 100%` 与 `max-height: 240px` **要同时给**，
+  只给一个另一个方向会撑破卡片；`.shot` 的 `display: block` 特异性高于 UA 的
+  `[hidden]`，必须显式补一条 `.shot[hidden] { display: none; }`，否则「没有图」时会留一块空白。
 
 ---
 
@@ -482,7 +510,7 @@ xime-clip-sync/
 ## 十、测试
 
 ```bash
-go test ./...          # 全部 155 个
+go test ./...          # 全部 158 个
 go test ./... -short   # 跳过会动真实剪贴板 / 注册表 / 真窗口的测试
 ```
 
@@ -558,8 +586,13 @@ Basic Auth、本地→远端、远端→本地、回声抑制、ETag 304、503 �
 | 填了值不再自动补文件名 | `TestRemotePathUserValueIsKept` |
 | 纯函数只做拼接 | `TestBuildFileURL` |
 | 不做旧格式识别，远程路径原样保留 | `TestLoadConfigKeepsRemotePathAsIs` |
-| 「远端原始内容」字段顺序 + 首尾截断 | `TestRemoteRawText`、`TestRemoteRawTextNilFields`、`TestHeadTail` |
 | 内容预览 150 字符截断 | `TestStatusPreviewTruncatesAt150` |
+| 「本地/远端内容」右上角的字符数是**完整**长度（不是 150 字符摘要的长度） | `TestStatusReportsFullTextChars` |
+| 只有手里真有字节才给得出图（不现读剪贴板、不现下附件） | `TestImagePNGOnlyWhenBytesAreHeld` |
+| 远端从图片变回文本时丢掉旧字节（否则界面画出过期的图） | `TestRemoteImageBytesDroppedWhenRemoteBecomesText` |
+| `/api/image`：有图 200 + `image/png`，没图与未知 side 一律 404 | `TestImageEndpoint` |
+| 「运行状态」页的「内容」两块：规模靠右、图片双向约束、按哈希去重、可点开原图 | `TestStatusPageContentPanels` |
+| 「程序设置」三张卡片按内容撑高（不许再用跨行 + 拉伸去凑两列） | `TestAppPageCardsSizeToContent` |
 | 配置固定在 exe 目录 | `TestConfigPathIsExeDir` |
 | 启动不重复拉取 | `TestNoRedundantStartupFetch` |
 | 托盘单击无响应、双击开界面 | `TestTrayClickAction`、`TestTrayWindowClassHasDblClks` |

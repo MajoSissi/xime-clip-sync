@@ -538,60 +538,6 @@ func TestDecodeProfile(t *testing.T) {
 	}
 }
 
-// 「远端原始内容」要按固定字段顺序输出，text 只留首尾各 5 个字符。
-func TestRemoteRawText(t *testing.T) {
-	src, name := "phone", "a.png"
-	got := remoteRawText(Profile{
-		Type:     "text",
-		Hash:     "abc123",
-		Text:     "0123456789ABCDEFGHIJ", // 20 字符 → 首 5 + 尾 5
-		HasData:  true,
-		DataName: &name,
-		Size:     20,
-		Source:   &src,
-	})
-	want := "type: text\n" +
-		"size: 20\n" +
-		"hash: abc123\n" +
-		"has_data: true\n" +
-		"data_name: a.png\n" +
-		"source: phone\n" +
-		"text: 01234…FGHIJ"
-	if got != want {
-		t.Errorf("remoteRawText 输出不符\n实际：\n%s\n期望：\n%s", got, want)
-	}
-}
-
-// data_name / source 为空时输出空值，不能冒出 "null" / "<nil>" 之类的东西。
-func TestRemoteRawTextNilFields(t *testing.T) {
-	got := remoteRawText(Profile{Type: "text", Text: "短"})
-	want := "type: text\nsize: 0\nhash: \nhas_data: false\ndata_name: \nsource: \ntext: 短"
-	if got != want {
-		t.Errorf("remoteRawText 输出不符\n实际：%q\n期望：%q", got, want)
-	}
-}
-
-// 首尾截断按**字符**算：中文和 emoji 都不能被劈成半个。
-func TestHeadTail(t *testing.T) {
-	cases := []struct {
-		in   string
-		n    int
-		want string
-	}{
-		{"", 5, ""},
-		{"短", 5, "短"},
-		{"0123456789", 5, "0123456789"},   // 正好 2n，不截
-		{"01234567890", 5, "01234…67890"}, // 多一个字符就截
-		{"你好世界一二三四五六七", 5, "你好世界一…三四五六七"},
-		{"😀😀😀😀😀😀😀😀😀😀😀", 5, "😀😀😀😀😀…😀😀😀😀😀"},
-	}
-	for _, c := range cases {
-		if got := headTail(c.in, c.n); got != c.want {
-			t.Errorf("headTail(%q, %d) = %q，期望 %q", c.in, c.n, got, c.want)
-		}
-	}
-}
-
 // 界面上「本地内容」「远端内容」超过 150 字符就截断并补省略号。
 func TestStatusPreviewTruncatesAt150(t *testing.T) {
 	if previewLen != 150 {
@@ -607,6 +553,120 @@ func TestStatusPreviewTruncatesAt150(t *testing.T) {
 	// 没超长的一字不动
 	if short := preview("短内容", previewLen); short != "短内容" {
 		t.Errorf("短内容不该被改动：%q", short)
+	}
+}
+
+// 界面上「本地内容 / 远端内容」右上角显示的字符数必须是**完整**长度。
+//
+// 拿 CurrentText 去算会得到一个看着合理、实际是错的数：它是 150 字符的摘要，
+// 400 字的文本会被显示成 151。这种错不会报任何异常，只能靠断言钉住。
+func TestStatusReportsFullTextChars(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	cfg := testConfig(srv.URL)
+	cfg.MaxTextChars = 0 // 不限制：本测试要看的是长度统计，不是超限判定
+	engine := NewSyncEngine(cfg, clip, NewLogBuffer(100))
+	engine.syncCycle(true)
+
+	clip.set(strings.Repeat("字", 400))
+	engine.checkLocalOnly()
+
+	st := engine.Status()
+	if st.CurrentTextChars != 400 {
+		t.Errorf("本地字符数 = %d，期望 400", st.CurrentTextChars)
+	}
+	if st.RemoteTextChars != 400 {
+		t.Errorf("远端字符数 = %d，期望 400", st.RemoteTextChars)
+	}
+	// 摘要本身照旧截断：长度和内容是两个字段，不能互相顶替
+	if n := runeCount(st.CurrentText); n != previewLen+1 {
+		t.Errorf("摘要长度 = %d，期望 %d（150 + 省略号）", n, previewLen+1)
+	}
+	// 文本侧不该带图片的元数据
+	if st.CurrentImageHash != "" || st.CurrentImageBytes != 0 {
+		t.Errorf("文本内容不该有图片元数据：hash=%q bytes=%d", st.CurrentImageHash, st.CurrentImageBytes)
+	}
+}
+
+// ImagePNG 是 /api/image 的数据来源：**只有引擎手里确实有字节时**才给得出图。
+//
+// 这条不变式是有意收窄的：
+//   - 为了画一张图去现读剪贴板 → 重新引入「和截图工具抢剪贴板」那个 bug；
+//   - 去现下附件 → 一个界面请求触发了网络 IO。
+//
+// 两者都不能做，所以「没有字节就返回 false」必须被钉住。
+func TestImagePNGOnlyWhenBytesAreHeld(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	// 还没有任何内容：两边都给不出图，未知 side 也不能悄悄退回本地那张
+	for _, side := range []string{"local", "remote", "nonsense"} {
+		if _, _, ok := engine.ImagePNG(side); ok {
+			t.Errorf("还没有图片时 side=%q 不该给得出图", side)
+		}
+	}
+
+	engine.syncCycle(true) // 远端为空 → 建立基线
+
+	png := makeNoisePNG(t, 16, 16)
+	clip.setImage(png)
+	engine.checkLocalOnly() // → 推上去
+
+	local, hash, ok := engine.ImagePNG("local")
+	if !ok {
+		t.Fatal("推送之后本地这一侧应该有图")
+	}
+	if !bytes.Equal(local, png) {
+		t.Error("返回的不是剪贴板里那张图")
+	}
+	// 缓存键必须是自己算的 SHA-256，否则同一张图换不出新的 URL
+	if want := hashBytes(png); hash != want {
+		t.Errorf("缓存键 = %q，期望 %q", hash, want)
+	}
+
+	// 推上去的就是远端现在的内容，所以远端那一侧也该画得出同一张图
+	remote, rhash, ok := engine.ImagePNG("remote")
+	if !ok {
+		t.Fatal("推送之后远端这一侧应该有图")
+	}
+	if !bytes.Equal(remote, png) || rhash != hash {
+		t.Errorf("远端这一侧的图应与推上去的那张一致：一致=%v hash=%q/%q",
+			bytes.Equal(remote, png), rhash, hash)
+	}
+}
+
+// 远端从「图片」变回「文本」时，手里留的那份图必须一起丢掉。
+//
+// 不丢的话界面会把上一张图继续画在「远端内容」里——而远端此刻根本不是那张图。
+func TestRemoteImageBytesDroppedWhenRemoteBecomesText(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	engine.syncCycle(true)
+
+	clip.setImage(makeNoisePNG(t, 16, 16))
+	engine.checkLocalOnly() // → 远端变成图片
+	if _, _, ok := engine.ImagePNG("remote"); !ok {
+		t.Fatal("推送图片后远端这一侧应该有图")
+	}
+
+	// 本机复制一段文本并推上去 → 远端内容换成文本
+	clip.set("换成了文本")
+	engine.checkLocalOnly()
+
+	if _, _, ok := engine.ImagePNG("remote"); ok {
+		t.Error("远端已经变成文本，不该还能取出图片")
+	}
+	st := engine.Status()
+	if st.RemoteKind != kindText || st.RemoteImageBytes != 0 {
+		t.Errorf("远端状态不符：kind=%q bytes=%d", st.RemoteKind, st.RemoteImageBytes)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"strconv"
 	"strings"
 )
 
@@ -154,49 +153,10 @@ func decodeProfile(raw []byte) (p Profile, plain bool, ok bool) {
 	}, true, true
 }
 
-// rawTextHeadTail 是「远端原始内容」里 text 字段保留的首尾字符数。
-const rawTextHeadTail = 5
-
-// remoteRawText 把远端 Profile 渲染成固定字段顺序的清单，供界面「远端原始内容」展示。
-//
-// 刻意**不**直接用 json.MarshalIndent 输出原文：
-//   - 字段顺序要固定（跟对端实现无关），否则同一个东西每次看起来都不一样；
-//   - text 必须截断——完整内容上面「远端内容」那块已经展示过了，这里再铺一遍
-//     既重复又把卡片撑长；只留首尾各 5 个字符反而更好用：
-//     头尾最容易暴露「被截断」「编码不对」「多了引号」这类问题。
-func remoteRawText(p Profile) string {
-	var b strings.Builder
-	line := func(k, v string) {
-		b.WriteString(k)
-		b.WriteString(": ")
-		b.WriteString(v)
-		b.WriteByte('\n')
-	}
-	line("type", p.Type)
-	line("size", strconv.Itoa(p.Size))
-	line("hash", p.Hash)
-	line("has_data", strconv.FormatBool(p.HasData))
-	line("data_name", derefString(p.DataName))
-	line("source", derefString(p.Source))
-	line("text", headTail(p.Text, rawTextHeadTail))
-	return strings.TrimRight(b.String(), "\n")
-}
-
 // derefString 解引用可空字符串字段，nil 一律当空串。
 func derefString(s *string) string {
 	if s == nil {
 		return ""
 	}
 	return *s
-}
-
-// headTail 只保留首尾各 n 个字符，中间用省略号连起来；不足 2n 个字符时原样返回。
-//
-// 按字符（rune）切，不按字节——否则中文和 emoji 会被劈成乱码。
-func headTail(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= 2*n {
-		return s
-	}
-	return string(r[:n]) + "…" + string(r[len(r)-n:])
 }

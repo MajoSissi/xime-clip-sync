@@ -18,8 +18,6 @@ const (
 	// 界面上「本地内容」和「远端内容」两块最多展示这么多字符，
 	// 超出的截断并补省略号。150 是「够看清内容是什么、又不至于把卡片撑成一大块」的长度。
 	previewLen = 150
-	// 远端原始内容在界面上最多展示这么多字符（只在解析失败、退化成原文时才用到）
-	rawPreviewLen = 400
 )
 
 // 剪贴板内容的两种形态。current/remote 的「已达成一致」状态要带上类型，
@@ -41,7 +39,6 @@ type Status struct {
 	Message      string `json:"message"`
 	CurrentText  string `json:"currentText"`
 	RemoteText   string `json:"remoteText"`
-	RemoteRaw    string `json:"remoteRaw"`
 	RemoteHash   string `json:"remoteHash"`
 	LocalHash    string `json:"localHash"`
 	HashMismatch bool   `json:"hashMismatch"`
@@ -58,12 +55,24 @@ type Status struct {
 	DeviceName    string `json:"deviceName"`
 	Autostart     bool   `json:"autostart"`
 
-	// 图片相关。Kind 是 "" / text / image，界面上据此把「内容」一栏渲染成文本或图片尺寸；
+	// 图片相关。Kind 是 "" / text / image，界面上据此把「内容」一栏渲染成文本或图片；
 	// *ImageBytes 是「已达成一致」的那张图的字节数（Kind 不是 image 时为 0）。
+	//
+	// *ImageHash 是界面取原图用的**内容地址**：/api/image 靠它做缓存键，
+	// 同一张图的 URL 不变、图换了 URL 就换，界面不会画出一张已经过期的图。
+	// 这里给的是本地自己算的 SHA-256，不是远端 JSON 里的 hash 字段——
+	// 对端可能用别的算法（见 noteHash），拿它当缓存键会错判。
+	//
+	// *TextChars 是**未截断**的字符数。上面 CurrentText / RemoteText 是 150 字符的摘要，
+	// 界面要显示的「多长」必须是完整长度，否则 1000 字的文本会显示成 150。
 	CurrentKind        string `json:"currentKind"`
 	RemoteKind         string `json:"remoteKind"`
 	CurrentImageBytes  int    `json:"currentImageBytes"`
 	RemoteImageBytes   int    `json:"remoteImageBytes"`
+	CurrentImageHash   string `json:"currentImageHash"`
+	RemoteImageHash    string `json:"remoteImageHash"`
+	CurrentTextChars   int    `json:"currentTextChars"`
+	RemoteTextChars    int    `json:"remoteTextChars"`
 	ImageOversizeCount int    `json:"imageOversizeCount"`
 }
 
@@ -88,7 +97,6 @@ type SyncEngine struct {
 	lastETag     string
 	remoteExists bool
 	remoteText   string
-	remoteRaw    string
 	remoteHash   string
 	localHash    string
 	hashMismatch bool
@@ -101,9 +109,22 @@ type SyncEngine struct {
 	currentKind      string
 	currentImageHash string
 	currentImageSize int
+	// 界面要把图片直接画出来，所以额外留一份 PNG 字节。
+	// PNG 是压过的（4K 截图约几十 KB），两份的内存代价可以忽略。
+	// 只在「引擎手里确实有这张图的字节」时非 nil：推送过、拉取过、或启动时读过剪贴板。
+	// 只有元数据没下过原图时（图片同步关着而远端是图）保持 nil，
+	// 界面上就只显示体积、不显示图——不为了画一张图去偷偷下附件或现读剪贴板，
+	// 那是同步该干的事，不该由一个界面请求触发。
+	currentImagePNG []byte
+
 	// 远端那边是什么内容（用于界面展示，以及判断要不要下载附件）
 	remoteKind      string
 	remoteImageSize int
+	// 远端图片的字节与它**本地算的** SHA-256（理由见 Status.ImageHash 的注释）。
+	// 与 remoteImageSize 不同步：Size 来自远端 JSON 的元数据，
+	// 而这两个字段只有在真的拿到字节之后才有值。
+	remoteImagePNG  []byte
+	remoteImageHash string
 
 	localSeq  uint32
 	seqPrimed bool
@@ -269,7 +290,6 @@ func (e *SyncEngine) Status() Status {
 		Enabled:       e.cfg.Enabled,
 		CurrentText:   preview(e.current, previewLen),
 		RemoteText:    preview(e.remoteText, previewLen),
-		RemoteRaw:     e.remoteRaw,
 		RemoteHash:    shortHash(e.remoteHash),
 		LocalHash:     shortHash(e.localHash),
 		HashMismatch:  e.hashMismatch,
@@ -286,6 +306,10 @@ func (e *SyncEngine) Status() Status {
 		RemoteKind:         e.remoteKind,
 		CurrentImageBytes:  e.currentImageSize,
 		RemoteImageBytes:   e.remoteImageSize,
+		CurrentImageHash:   e.currentImageHash,
+		RemoteImageHash:    e.remoteImageHash,
+		CurrentTextChars:   runeCount(e.current),
+		RemoteTextChars:    runeCount(e.remoteText),
 		ImageOversizeCount: e.imageOversize,
 	}
 	if !e.lastPushAt.IsZero() {
@@ -416,6 +440,7 @@ func (e *SyncEngine) primeImageBaseline(cfg Config) {
 	e.currentKind = kindImage
 	e.currentImageHash = hashBytes(pngData)
 	e.currentImageSize = len(pngData)
+	e.currentImagePNG = pngData
 	e.mu.Unlock()
 	e.log.SyncInfof("启动基线：本地图片 %s", humanBytes(int64(len(pngData))))
 }
@@ -570,6 +595,34 @@ func (e *SyncEngine) getCurrentImageHash() string {
 	return e.currentImageHash
 }
 
+// ImagePNG 返回界面上要画的那张图的 PNG 字节，以及它的内容哈希（缓存键）。
+//
+// side 取 "local" / "remote"；只有引擎手里确实有字节时 ok 才为真——
+// 推送过、拉取过、或启动时读过剪贴板。
+//
+// 刻意**不**为了画一张图去现读剪贴板、也不去现下附件：那是同步的职责，
+// 不该由一个界面请求触发。现读剪贴板还会和截图工具抢剪贴板，
+// 正是「截图进不了 Ditto」那个 bug 的来源，不能从这条路上再开一个口子。
+//
+// 返回的切片是引擎自己那份，调用方只能读、不能改。
+func (e *SyncEngine) ImagePNG(side string) ([]byte, string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch side {
+	case "local":
+		if e.currentKind != kindImage || len(e.currentImagePNG) == 0 {
+			return nil, "", false
+		}
+		return e.currentImagePNG, e.currentImageHash, true
+	case "remote":
+		if e.remoteKind != kindImage || len(e.remoteImagePNG) == 0 {
+			return nil, "", false
+		}
+		return e.remoteImagePNG, e.remoteImageHash, true
+	}
+	return nil, "", false
+}
+
 // localChanged 报告剪贴板自上次读取以来是否变化。
 // 有廉价序号（Windows）时先用它预判，序号没变就不去读剪贴板内容。
 func (e *SyncEngine) localChanged() bool {
@@ -639,10 +692,13 @@ func (e *SyncEngine) pushRemote(cfg Config, text string) bool {
 	e.currentKind = kindText
 	e.currentImageHash = ""
 	e.currentImageSize = 0
+	e.currentImagePNG = nil
 	e.remoteExists = true
 	e.remoteText = text
 	e.remoteKind = kindText
 	e.remoteImageSize = 0
+	e.remoteImagePNG = nil
+	e.remoteImageHash = ""
 	e.pushCount++
 	e.lastError, e.lastErrLog = "", ""
 	e.mu.Unlock()
@@ -701,10 +757,15 @@ func (e *SyncEngine) pushImageRemote(cfg Config, pngData []byte) bool {
 	e.currentKind = kindImage
 	e.currentImageHash = prof.Hash
 	e.currentImageSize = len(pngData)
+	e.currentImagePNG = pngData
 	e.remoteExists = true
 	e.remoteText = ""
 	e.remoteKind = kindImage
 	e.remoteImageSize = len(pngData)
+	// 刚推上去的就是远端现在的内容，字节同一份，界面两边都能画出来。
+	// prof.Hash 就是 hashBytes(pngData)，所以拿它当远端那一侧的缓存键也对。
+	e.remoteImagePNG = pngData
+	e.remoteImageHash = prof.Hash
 	e.pushCount++
 	e.lastError, e.lastErrLog = "", ""
 	e.mu.Unlock()
@@ -769,18 +830,7 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 		return
 	}
 
-	// 保留远端原始内容，便于排查与手机端的协议兼容问题。
-	// 渲染成固定字段顺序的清单（见 remoteRawText），而不是直接把 JSON 原文丢上去——
-	// 原文里 text 可能很长，而且字段顺序随对端实现而变，看不出哪个字段是什么。
 	prof, plain, ok := decodeProfile(body)
-	e.mu.Lock()
-	if ok {
-		e.remoteRaw = remoteRawText(prof)
-	} else {
-		// 解析不出来时退回原文，至少让用户看到服务器到底返回了什么
-		e.remoteRaw = preview(string(body), rawPreviewLen)
-	}
-	e.mu.Unlock()
 	if !ok {
 		return
 	}
@@ -797,6 +847,11 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 	}
 	e.remoteExists = true
 	e.remoteText = prof.Text
+	// 只有元数据，先把手里的字节丢掉：它可能是**上一张**图的，
+	// 留着会让界面画出一张已经不是远端当前内容的图。
+	// 等真的下载完（applyRemoteImage）再放回来。
+	e.remoteImagePNG = nil
+	e.remoteImageHash = ""
 	if prof.HasData {
 		e.remoteKind = kindImage
 		e.remoteImageSize = prof.Size
@@ -830,6 +885,7 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 	e.currentKind = kindText
 	e.currentImageHash = ""
 	e.currentImageSize = 0
+	e.currentImagePNG = nil
 	e.pullCount++
 	e.lastError, e.lastErrLog = "", ""
 	e.mu.Unlock()
@@ -900,6 +956,10 @@ func (e *SyncEngine) applyRemoteImage(cfg Config, prof Profile, currentKind, cur
 	e.currentKind = kindImage
 	e.currentImageHash = hash
 	e.currentImageSize = len(data)
+	// 刚下下来并写进剪贴板的就是这一份，两边字节相同。
+	e.currentImagePNG = data
+	e.remoteImagePNG = data
+	e.remoteImageHash = hash
 	e.pullCount++
 	e.lastError, e.lastErrLog = "", ""
 	e.mu.Unlock()

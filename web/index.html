@@ -72,23 +72,24 @@
   .tabs button:hover { background: var(--panel); color: var(--text); }
   .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
 
-  /* ---------- 页面：一次只显示一页，每页两张卡片 ---------- */
+  /* ---------- 页面：一次只显示一页，每页若干张卡片 ---------- */
   .page {
     display: none; gap: 16px; align-items: start;
     padding: 18px 24px 24px;
   }
   .page.active { display: grid; }
-  /* 同步设置 / 程序设置：两张等宽卡片 */
-  .page.sync, .page.app { grid-template-columns: repeat(2, minmax(320px, 1fr)); }
-  /* 程序设置有三张卡片：让「启动与日志」占两行，右列就能落下另外两张。
-     否则第三个卡片会孤零零占掉第二行的左半格、右半格空着。 */
-  .page.app > section.tall { grid-row: span 2; align-self: stretch; }
+  /* 同步设置：两张等宽卡片 */
+  .page.sync { grid-template-columns: repeat(2, minmax(320px, 1fr)); }
+  /* 程序设置：三张卡片一张一行，各按内容撑高。
+     早先这里是让「启动与日志」跨两行 + align-self:stretch，靠拉伸去填满右列——
+     可那张卡片只有两行内容，拉完底下空出 125px，卡片里的空白比内容还多。
+     三列各占一格之后每张卡片都是自然高度，多出来的空档留在页面上、不在卡片里，
+     整页也从 386px 收到 237px。 */
+  .page.app { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   /* 运行状态：左边状态卡片收窄，把宽度让给日志（日志行又长又多） */
   .page.status { grid-template-columns: minmax(340px, 460px) minmax(0, 1fr); }
   @media (max-width: 1020px) {
     .page.sync, .page.app, .page.status { grid-template-columns: minmax(0, 1fr); }
-    /* 单列时取消跨行：跨行是给两列布局用的，单列下只会凭空空出一块 */
-    .page.app > section.tall { grid-row: auto; }
   }
 
   section {
@@ -206,15 +207,38 @@
   .previews { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
   .preview {
     background: var(--panel-2); border: 1px solid var(--border-soft);
-    border-radius: 8px; padding: 9px 12px;
+    border-radius: 8px; padding: 9px 12px; min-width: 0;
   }
-  .preview .k { font-size: 11px; color: var(--text-faint); margin-bottom: 5px; }
+  /* 标题一行：左边「本地内容 / 远端内容」，右边靠右给出这一侧的规模
+     （文本多少字符、图片多少字节）。判断「同步过去的是不是这一份」
+     靠的就是这个数，所以它一直在，哪怕内容是图片。 */
+  .preview .head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 10px; margin-bottom: 5px;
+  }
+  .preview .k { font-size: 11px; color: var(--text-faint); }
+  .preview .meta {
+    font-size: 11px; color: var(--text-faint);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
   /* 内容已经在服务端按 150 字符截断了，高度天然有界，
      所以这里不再加 max-height —— 否则会多出一个「明明没多少字却要滚」的滚动条。 */
   .preview .v {
     font-size: 12.5px; font-family: Consolas, "Cascadia Mono", monospace;
     white-space: pre-wrap; word-break: break-all; color: #c9d2e3;
   }
+  /* 图片直接画出来。max-width + max-height 双约束、宽高 auto，
+     浏览器会等比缩放到框内，多宽的图都不会撑破卡片。
+     [hidden] 必须显式写：上面的 display:block 特异性比 UA 的 [hidden] 高，
+     不补这一条的话「没有图」时也会占一块位置。 */
+  .preview .shot {
+    display: block; margin-top: 2px;
+    max-width: 100%; max-height: 240px; width: auto; height: auto;
+    border: 1px solid var(--border); border-radius: 6px; background: #0d0f14;
+    cursor: zoom-in;
+  }
+  .preview .shot[hidden] { display: none; }
+  .preview .v[hidden] { display: none; }
 
   /* ---------- 日志 ---------- */
   /* 「运行状态」页只放同步日志——这一页是查「剪贴板为什么没同步过去」的地方。
@@ -362,16 +386,20 @@
 
       <div class="previews">
         <div class="preview">
-          <div class="k">本地内容</div>
-          <div class="v" id="curText">—</div>
+          <div class="head">
+            <span class="k">本地内容</span>
+            <span class="meta" id="localMeta"></span>
+          </div>
+          <div class="v" id="localText">—</div>
+          <img class="shot" id="localShot" alt="本地图片" hidden>
         </div>
         <div class="preview">
-          <div class="k">远端内容</div>
-          <div class="v" id="remText">—</div>
-        </div>
-        <div class="preview">
-          <div class="k">远端原始内容</div>
-          <div class="v" id="remRaw">—</div>
+          <div class="head">
+            <span class="k">远端内容</span>
+            <span class="meta" id="remoteMeta"></span>
+          </div>
+          <div class="v" id="remoteText">—</div>
+          <img class="shot" id="remoteShot" alt="远端图片" hidden>
         </div>
       </div>
 
@@ -390,7 +418,7 @@
   <!-- ======== 页三：程序设置（启动与日志 + 配置界面 + 网络代理） ======== -->
   <div class="page app" id="page-app">
 
-    <section class="tall">
+    <section>
       <h2>启动与日志</h2>
       <div class="fields">
         <div class="checks">
@@ -575,6 +603,61 @@ async function api(path, body, method) {
   return resp.json();
 }
 
+// setShot 决定「要不要重新取这张图」。
+//
+// status 每 2 秒推一次，无脑重设 img.src 会让浏览器反复请求同一张图并闪一下。
+// 哈希没变就什么都不做——URL 是按内容寻址的（见 /api/image），
+// 同一个哈希必然同一张图，哈希变了才需要换。
+function setShot(img, side, hash) {
+  if (!hash) {
+    img.hidden = true;
+    img.removeAttribute("src");
+    img.dataset.h = "";
+    return;
+  }
+  if (img.dataset.h === hash) {
+    img.hidden = false;
+    return;
+  }
+  img.dataset.h = hash;
+  img.hidden = false;
+  img.src = "/api/image?side=" + side + "&h=" + encodeURIComponent(hash);
+}
+
+// renderSide 画「本地内容 / 远端内容」里的一侧。
+//
+//   kind === "image" → 直接画出原图，右上角标体积
+//   kind === "text"  → 显示文本摘要，右上角标**完整**字符数
+//   kind === ""      → 这一侧还没有内容，显示 o.empty
+//
+// 图片取不到时（服务端只有元数据、没下过原图）退回纯文字：
+// 光留个空白框会让人以为是加载失败。
+function renderSide(side, o) {
+  const meta = $(side + "Meta");
+  const box = $(side + "Text");
+  const img = $(side + "Shot");
+
+  if (o.kind === "image") {
+    meta.textContent = fmtBytes(o.bytes);
+    setShot(img, side, o.hash);
+    box.hidden = !img.hidden;
+    box.textContent = img.hidden ? "（未取到原图）" : "";
+    return;
+  }
+
+  img.hidden = true;
+  img.removeAttribute("src");
+  img.dataset.h = "";
+  box.hidden = false;
+  if (o.kind === "text") {
+    meta.textContent = o.chars + " 字符";
+    box.textContent = o.text || "（空）";
+    return;
+  }
+  meta.textContent = "";
+  box.textContent = o.empty;
+}
+
 function renderStatus(st) {
   const pill = $("state");
   pill.className = "pill state-" + st.state;
@@ -586,18 +669,17 @@ function renderStatus(st) {
   $("oversizeCount").textContent = st.oversizeCount || 0;
   $("imageOversizeCount").textContent = st.imageOversizeCount || 0;
 
-  // 「内容」一栏按类型渲染：图片没有文本可看，显示体积更有用。
-  $("curText").textContent = st.currentKind === "image"
-    ? "🖼 图片（" + fmtBytes(st.currentImageBytes) + "）"
-    : (st.currentText || "（空）");
-  if (!st.remoteExists) {
-    $("remText").textContent = "（远端暂无文件）";
-  } else if (st.remoteKind === "image") {
-    $("remText").textContent = "🖼 图片（" + fmtBytes(st.remoteImageBytes) + "）";
-  } else {
-    $("remText").textContent = st.remoteText || "（空）";
-  }
-  $("remRaw").textContent = st.remoteRaw || "（尚未读取）";
+  // 「内容」两块按类型渲染：文本看字符数，图片看体积 + 原图。
+  renderSide("local", {
+    kind: st.currentKind, text: st.currentText, chars: st.currentTextChars,
+    bytes: st.currentImageBytes, hash: st.currentImageHash, empty: "—",
+  });
+  // 远端连文件都没有时 currentKind 之类的字段都没意义，一律按「空」渲染。
+  renderSide("remote", {
+    kind: st.remoteExists ? st.remoteKind : "", text: st.remoteText,
+    chars: st.remoteTextChars, bytes: st.remoteImageBytes,
+    hash: st.remoteImageHash, empty: "（远端暂无文件）",
+  });
 
   // 配置界面地址跟着端口走，放在「程序设置 · 配置界面」里，可以点开/复制。
   const a = $("uiUrl");
@@ -714,6 +796,15 @@ async function init() {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
       save();
+    }
+  });
+
+  // 预览框里的图最多只有卡片那么宽（300 多像素），截图缩到那个尺寸看不清。
+  // 点一下开原图——/api/image 返回的就是原尺寸 PNG。
+  document.addEventListener("click", (e) => {
+    const el = e.target;
+    if (el && el.classList && el.classList.contains("shot") && el.src) {
+      window.open(el.src, "_blank");
     }
   });
 }

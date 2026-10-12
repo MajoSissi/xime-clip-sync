@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -254,6 +255,27 @@ func (s *Server) Handler() http.Handler {
 	// 日志（两条通道各自返回，界面上各占一块面板）
 	mux.HandleFunc("/api/logs", localOnly(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.log.LinesByKind(300))
+	}))
+
+	// 「运行状态」页把本地/远端的图片直接画出来。
+	//
+	// 内容寻址：URL 里带的是引擎算的 SHA-256（side + h）。同一张图的 URL 不变，
+	// 可以放心长缓存；图换了 URL 就换，不会把旧图画在「远端内容」里。
+	// 前端也只在 h 变化时才重设 img.src，所以正常情况下这张图一个生命周期只取一次。
+	//
+	// 引擎手里没有字节时（只有元数据，例如图片同步关着而远端是图）返回 404，
+	// 界面就退回到「只显示体积」。这里**不**去现读剪贴板、也不去现下附件。
+	mux.HandleFunc("/api/image", localOnly(func(w http.ResponseWriter, r *http.Request) {
+		data, hash, ok := s.engine.ImagePNG(r.URL.Query().Get("side"))
+		if !ok {
+			http.Error(w, "这一侧没有可展示的图片", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("ETag", `"`+hash+`"`)
+		w.Header().Set("Cache-Control", "max-age=31536000, immutable")
+		// ServeContent 顺带把 Range 与 If-None-Match（上面那个 ETag）一起处理了
+		http.ServeContent(w, r, "clipboard.png", time.Time{}, bytes.NewReader(data))
 	}))
 
 	// 日志实时推送（SSE）

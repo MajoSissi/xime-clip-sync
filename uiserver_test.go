@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -775,6 +778,140 @@ func TestStatusPageShowsOnlySyncLogs(t *testing.T) {
 	// /api/logs 仍然按通道返回，前端只取同步那一份
 	if !strings.Contains(html, "logs.sync") {
 		t.Error("web/index.html 没有从 /api/logs 里取同步通道")
+	}
+}
+
+// 「运行状态」页的「本地内容 / 远端内容」两块：规模靠右、图片直接画在框内。
+//
+// 这几件事都会**静默**失效：id 写错只是永远空着；少了 [hidden] 那条规则
+// 只是多出一块空白；少了哈希去重只是每 2 秒白请求一次图。都看不出异常。
+func TestStatusPageContentPanels(t *testing.T) {
+	html := string(indexHTML)
+
+	// 「远端原始内容」整块连同它的数据来源一起删掉了，不该留任何残迹
+	for _, bad := range []string{"远端原始内容", `id="remRaw"`, `id="curText"`, `id="remText"`} {
+		if strings.Contains(html, bad) {
+			t.Errorf("web/index.html 不该再有 %s", bad)
+		}
+	}
+
+	// 每侧三个元素：靠右的规模、文本容器、图片
+	for _, want := range []string{
+		`id="localMeta"`, `id="localText"`, `id="localShot"`,
+		`id="remoteMeta"`, `id="remoteText"`, `id="remoteShot"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("web/index.html 缺少 %s", want)
+		}
+	}
+
+	// 靠右：标签与数值是同一个 flex 行的两端
+	if !strings.Contains(html, "justify-content: space-between") {
+		t.Error("标题行没有把规模靠右对齐")
+	}
+	// 限在框内：宽高两个方向都要约束，只给一个的话另一个方向会撑破卡片
+	if !strings.Contains(html, "max-width: 100%") || !strings.Contains(html, "max-height: 240px") {
+		t.Error("图片没有同时约束宽高，会撑破卡片")
+	}
+	// .shot 的 display:block 特异性高于 UA 的 [hidden]，必须显式补回来
+	if !strings.Contains(html, ".shot[hidden] { display: none; }") {
+		t.Error("图片的 [hidden] 被 display:block 覆盖，没图时会留一块空白")
+	}
+
+	// 取图必须按内容哈希去重，否则每 2 秒一次的 status 推送会让浏览器反复请求同一张图
+	if !strings.Contains(html, "img.dataset.h === hash") {
+		t.Error("setShot 没有按哈希去重，同一张图会被反复请求")
+	}
+	if !strings.Contains(html, `"/api/image?side="`) {
+		t.Error("setShot 没有走 /api/image")
+	}
+	// 卡片只有 300 多像素宽，缩略图看不清，点一下要能开原图
+	if !strings.Contains(html, `classList.contains("shot")`) {
+		t.Error("预览图没有接上「点击看原图」")
+	}
+}
+
+// 「程序设置」页的三张卡片各按内容撑高，不再靠拉伸去凑两列。
+//
+// 早先是让「启动与日志」跨两行 + `align-self: stretch` 去填满右列，可那张卡片
+// 只有两行内容，拉完底下空出 125px —— 卡片里的空白比内容还多。
+//
+// 这件事会**静默**回来：加回 `.tall` / `grid-row: span 2` 页面上不报任何错，
+// 只是那张卡片底下又白一块。所以在这里钉住。
+func TestAppPageCardsSizeToContent(t *testing.T) {
+	html := string(indexHTML)
+
+	for _, bad := range []string{"section.tall", `class="tall"`, "grid-row: span 2", "align-self: stretch"} {
+		if strings.Contains(html, bad) {
+			t.Errorf("「程序设置」页不该再有 %s（会把卡片拉到两行高、底下空一块）", bad)
+		}
+	}
+	// 三张卡片一张一行，各自自然高度
+	if !strings.Contains(html, ".page.app { grid-template-columns: repeat(3,") {
+		t.Error("「程序设置」页应三列并排，让每张卡片按内容撑高")
+	}
+	// 程序设置是三列、同步设置是两列，两者不能再共用一条列定义
+	if !strings.Contains(html, ".page.sync { grid-template-columns: repeat(2,") {
+		t.Error("「同步设置」页的两列定义应独立于「程序设置」")
+	}
+}
+
+// /api/image 按 side 给图：手里有字节 → 200 + image/png；只有元数据 → 404。
+//
+// 404 是**正常**结果（图片同步关着而远端是图），前端据此退回「只显示体积」。
+// 这里必须钉住「取不到就 404」，别哪天改成「顺手去读一下剪贴板」——
+// 那正是「截图进不了 Ditto」那个 bug 的来源。
+func TestImageEndpoint(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	engine := NewSyncEngine(testConfig(srv.URL), clip, NewLogBuffer(100))
+	ui := httptest.NewServer(NewServer(engine, NewLogBuffer(10), "config.json").Handler())
+	defer ui.Close()
+
+	get := func(query string) (int, string, []byte) {
+		t.Helper()
+		resp, err := http.Get(ui.URL + "/api/image" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, resp.Header.Get("Content-Type"), body
+	}
+
+	// 还没有任何图片：404，而不是 200 加一个空 body
+	if code, _, _ := get("?side=local"); code != http.StatusNotFound {
+		t.Errorf("没有图片时 HTTP %d，期望 404", code)
+	}
+	// 未知 side 不能悄悄退回本地那张
+	if code, _, _ := get("?side=nonsense"); code != http.StatusNotFound {
+		t.Errorf("未知 side 的 HTTP %d，期望 404", code)
+	}
+
+	engine.syncCycle(true)
+	png := makeNoisePNG(t, 16, 16)
+	clip.setImage(png)
+	engine.checkLocalOnly() // → 推上去
+
+	code, ctype, body := get("?side=local")
+	if code != http.StatusOK {
+		t.Fatalf("本地图片 HTTP %d，期望 200", code)
+	}
+	if ctype != "image/png" {
+		t.Errorf("Content-Type = %q，期望 image/png", ctype)
+	}
+	if !bytes.Equal(body, png) {
+		t.Error("返回的字节与剪贴板里的 PNG 不一致")
+	}
+
+	// 推上去的就是远端现在的内容，远端那一侧同样取得到
+	if code, _, rbody := get("?side=remote"); code != http.StatusOK || !bytes.Equal(rbody, png) {
+		t.Errorf("远端图片 HTTP %d，字节一致=%v", code, bytes.Equal(rbody, png))
 	}
 }
 
