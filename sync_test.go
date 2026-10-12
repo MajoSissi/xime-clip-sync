@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,10 +34,18 @@ type fakeWebDAV struct {
 	putCount int
 	getCount int
 	mkcol    int
+	// putOrder 记录 PUT 的路径顺序（图片要求「先 blob 后 JSON」）
+	putOrder []string
 	// 期望的 Basic 凭据（user:pass），为空表示不校验
 	wantAuth string
 	// 返回 503 限流
 	rateLimit bool
+	// putMissingParentStatus / putMissingParentBody 覆盖「父目录不存在时 PUT 怎么回」。
+	// 0 = 409（标准）；设成 403 可模拟坚果云 / 反向代理后的 WebDAV。
+	putMissingParentStatus int
+	putMissingParentBody   string
+	// mkcolStatus 非 0 时，所有 MKCOL 一律返回该状态（用来模拟「目录也建不起来」）。
+	mkcolStatus int
 }
 
 func newFakeWebDAV() *fakeWebDAV {
@@ -67,6 +80,10 @@ func (f *fakeWebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "MKCOL":
 		f.mkcol++
+		if f.mkcolStatus != 0 {
+			w.WriteHeader(f.mkcolStatus)
+			return
+		}
 		if f.dirs[path] {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -84,8 +101,19 @@ func (f *fakeWebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !f.dirs[parentDir(path)] {
-			// 父目录不存在：部分服务器返回 409，部分返回 404
-			w.WriteHeader(http.StatusConflict)
+			// 父目录不存在：409 是标准，404 见 Alist/Nextcloud，
+			// 403 见部分坚果云 / 反向代理后的 WebDAV（本 fake 可配置）
+			status := f.putMissingParentStatus
+			if status == 0 {
+				status = http.StatusConflict
+			}
+			if f.putMissingParentBody != "" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			}
+			w.WriteHeader(status)
+			if f.putMissingParentBody != "" {
+				io.WriteString(w, f.putMissingParentBody)
+			}
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -94,6 +122,7 @@ func (f *fakeWebDAV) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.files[path] = body
 		f.etags[path] = et
 		f.putCount++
+		f.putOrder = append(f.putOrder, path)
 		w.Header().Set("ETag", et)
 		w.WriteHeader(http.StatusCreated)
 
@@ -137,12 +166,39 @@ func (f *fakeWebDAV) file(path string) (string, bool) {
 	return string(b), ok
 }
 
+// hasDir 报告某个目录是否已在远端存在（「测试连接建目录」的用例要看它）。
+func (f *fakeWebDAV) hasDir(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dirs[path]
+}
+
 func (f *fakeWebDAV) setFile(path, content string) {
+	f.setFileBytes(path, []byte(content))
+}
+
+// setFileBytes 直接放一段二进制内容（图片 blob 用）。
+func (f *fakeWebDAV) setFileBytes(path string, content []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.etagSeq++
-	f.files[path] = []byte(content)
+	f.files[path] = content
 	f.etags[path] = fmt.Sprintf("%q", fmt.Sprintf("v%d", f.etagSeq))
+}
+
+// blob 返回远端某个附件的内容。
+func (f *fakeWebDAV) blob(path string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.files[path]
+	return b, ok
+}
+
+// puts 返回 PUT 的路径顺序（图片要求「先 blob 后 JSON」）。
+func (f *fakeWebDAV) puts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.putOrder...)
 }
 
 func (f *fakeWebDAV) counts() (put, get int) {
@@ -156,6 +212,7 @@ func (f *fakeWebDAV) counts() (put, get int) {
 type fakeClipboard struct {
 	mu       sync.Mutex
 	text     string
+	image    []byte // PNG 字节；非空表示剪贴板里是图片
 	seq      uint32
 	setCount int
 }
@@ -163,6 +220,10 @@ type fakeClipboard struct {
 func (c *fakeClipboard) GetText() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// 真实 Windows 上「复制一张图片」的剪贴板里没有 CF_UNICODETEXT，读出来就是空串
+	if c.image != nil {
+		return "", nil
+	}
 	return c.text, nil
 }
 
@@ -170,6 +231,7 @@ func (c *fakeClipboard) SetText(text string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.text = text
+	c.image = nil
 	c.seq++
 	c.setCount++
 	return nil
@@ -181,6 +243,39 @@ func (c *fakeClipboard) Seq() (uint32, bool) {
 	return c.seq, true
 }
 
+// HasImage / GetImage / SetImage 让假剪贴板也满足 imageClipboard，
+// 这样图片相关的同步链路能在不碰真实剪贴板的前提下端到端跑。
+func (c *fakeClipboard) HasImage() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.image != nil
+}
+
+func (c *fakeClipboard) GetImage() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.image == nil {
+		return nil, nil
+	}
+	out := make([]byte, len(c.image))
+	copy(out, c.image)
+	return out, nil
+}
+
+func (c *fakeClipboard) SetImage(png []byte) error {
+	// 真实实现会先解码校验；这里也校验一下，免得测试把坏数据当成合法图片
+	if _, err := decodePNG(png); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.image = append([]byte(nil), png...)
+	c.text = ""
+	c.seq++
+	c.setCount++
+	return nil
+}
+
 // sets 返回写入剪贴板的次数。
 func (c *fakeClipboard) sets() int {
 	c.mu.Lock()
@@ -188,11 +283,21 @@ func (c *fakeClipboard) sets() int {
 	return c.setCount
 }
 
-// set 模拟用户复制：内容变化并推进序号。
+// set 模拟用户复制文本：内容变化并推进序号。
 func (c *fakeClipboard) set(text string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.text = text
+	c.image = nil
+	c.seq++
+}
+
+// setImage 模拟用户复制图片：剪贴板里只有位图、没有文本。
+func (c *fakeClipboard) setImage(png []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.image = append([]byte(nil), png...)
+	c.text = ""
 	c.seq++
 }
 
@@ -200,6 +305,16 @@ func (c *fakeClipboard) get() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.text
+}
+
+// getImage 返回当前剪贴板里的图片字节（没有则 nil）。
+func (c *fakeClipboard) getImage() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.image == nil {
+		return nil
+	}
+	return append([]byte(nil), c.image...)
 }
 
 // ---------------------------------------------------------------- 测试
@@ -630,7 +745,7 @@ func TestSyncLogLinesAreShort(t *testing.T) {
 	fake.setFile(remoteFilePath, `{"type":"text","hash":"x","text":"来自手机的内容","has_data":false,"data_name":null,"size":21,"source":"phone"}`)
 	engine.syncCycle(true)
 
-	all := lb.Lines(0)
+	all := lb.Lines(LogSync, 0)
 	var pushLine, pullLine string
 	for _, l := range all {
 		if strings.HasPrefix(l.Text, "⬆") {
@@ -771,6 +886,70 @@ func TestUIServer(t *testing.T) {
 	resp.Body.Close()
 	if !st.Configured || st.DeviceName != "test-pc" {
 		t.Errorf("状态接口异常：%+v", st)
+	}
+}
+
+// 同步引擎写出来的日志必须落在同步通道里，一条都不能漏到程序通道；
+// /api/logs 也要把两条通道分开返回，且每行都带 kind——
+// 界面就是靠它决定这一行进「同步日志」还是「程序日志」面板的。
+func TestSyncLogsStayOnSyncChannel(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	lb := NewLogBuffer(100)
+	engine := NewSyncEngine(testConfig(srv.URL), clip, lb)
+
+	engine.syncCycle(true)  // 建立基线
+	clip.set("要推过去的内容")     // 用户复制了新内容
+	engine.checkLocalOnly() // → ⬆ 推送
+	lb.Infof("程序自己的事")      // 程序通道的一条
+
+	syncLines := lb.Lines(LogSync, 0)
+	if len(syncLines) == 0 {
+		t.Fatal("同步通道里一条日志都没有")
+	}
+	pushed := false
+	for _, l := range syncLines {
+		if l.Kind != LogSync {
+			t.Errorf("同步通道里混进了 kind=%q 的日志：%+v", l.Kind, l)
+		}
+		if strings.HasPrefix(l.Text, "⬆") {
+			pushed = true
+		}
+	}
+	if !pushed {
+		t.Errorf("推送没写进同步通道：%+v", syncLines)
+	}
+
+	appLines := lb.Lines(LogApp, 0)
+	if len(appLines) != 1 || appLines[0].Text != "程序自己的事" {
+		t.Errorf("程序通道内容不符：%+v", appLines)
+	}
+
+	// HTTP 层：两条通道分开返回，行里带 kind
+	ui := httptest.NewServer(NewServer(engine, lb, "config.json").Handler())
+	defer ui.Close()
+	resp, err := http.Get(ui.URL + "/api/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string][]LogLine
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if len(got["sync"]) != len(syncLines) {
+		t.Errorf("/api/logs 的 sync 应有 %d 行，实际 %d 行", len(syncLines), len(got["sync"]))
+	}
+	if len(got["app"]) != 1 || got["app"][0].Kind != LogApp {
+		t.Errorf("/api/logs 的 app 通道不符：%+v", got["app"])
+	}
+	for _, l := range got["sync"] {
+		if l.Kind != LogSync {
+			t.Errorf("/api/logs 的 sync 里混进了 %+v", l)
+		}
 	}
 }
 
@@ -1215,13 +1394,13 @@ func TestTransferErrorRetriesOnce(t *testing.T) {
 
 	// 重试这件事必须留痕：否则日志里只有「最终成功了」，看不出中间抖动过。
 	var sawRetry bool
-	for _, l := range lb.Lines(0) {
+	for _, l := range lb.Lines(LogSync, 0) {
 		if strings.Contains(l.Text, "重试") {
 			sawRetry = true
 		}
 	}
 	if !sawRetry {
-		t.Errorf("重试没有记日志，实际日志：%+v", lb.Lines(0))
+		t.Errorf("重试没有记日志，实际日志：%+v", lb.Lines(LogSync, 0))
 	}
 }
 
@@ -1265,3 +1444,864 @@ func TestTimeoutIsNotRetried(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- 图片同步
+
+const blobDirPath = "/dav/xime/clipboard/blobs"
+
+// makeNoisePNG 造一张 w×h 的 PNG，像素是伪随机噪声（不可压缩），
+// 体积大致 = w*h*4 字节，方便构造「超过上限」的用例。
+func makeNoisePNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	x := uint32(0x9E3779B9)
+	for i := range img.Pix {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		img.Pix[i] = uint8(x)
+	}
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = 255 // 不透明，避免预乘带来的额外差异
+	}
+	data, err := encodePNG(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// makeBigPNG 造一张编码后**大于** minBytes 的噪声图。
+//
+// 图片上限的单位是 MB，所以「超限」用例需要一张实打实超过 1 MB 的图。
+// 噪声不可压缩，PNG 体积基本随像素数线性涨，按几档边长试到够大为止。
+func makeBigPNG(t *testing.T, minBytes int) []byte {
+	t.Helper()
+	for _, n := range []int{256, 512, 700, 1024, 1400} {
+		if png := makeNoisePNG(t, n, n); len(png) > minBytes {
+			return png
+		}
+	}
+	t.Fatalf("无法生成大于 %d 字节的测试图", minBytes)
+	return nil
+}
+
+// makeSolidPNG 造一张很小的纯色 PNG（体积几十字节）。
+func makeSolidPNG(t *testing.T, w, h int, c color.NRGBA) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetNRGBA(x, y, c)
+		}
+	}
+	data, err := encodePNG(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// blobPath 由附件名拼出远端路径。
+func blobPath(dataName string) string { return blobDirPath + "/" + dataName }
+
+// 图片记录的 wire 格式：has_data 为真、data_name 是内容寻址的 <sha256>.png。
+func TestImageProfileWireFormat(t *testing.T) {
+	png := makeSolidPNG(t, 2, 2, color.NRGBA{R: 1, G: 2, B: 3, A: 255})
+	p := newImageProfile(png, "my-pc")
+
+	data, err := p.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"type", "hash", "text", "has_data", "data_name", "size", "source"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("缺少字段 %q，实际 JSON：%s", k, data)
+		}
+	}
+	if m["type"] != "image" || m["has_data"] != true {
+		t.Errorf("type/has_data 不符：%s", data)
+	}
+	wantName := hashBytes(png) + ".png"
+	if m["data_name"] != wantName {
+		t.Errorf("data_name 应为内容寻址 %q，实际 %v", wantName, m["data_name"])
+	}
+	if m["hash"] != hashBytes(png) {
+		t.Errorf("hash 应为图片字节的 SHA-256：%v", m["hash"])
+	}
+	if int(m["size"].(float64)) != len(png) {
+		t.Errorf("size 应为 PNG 字节数 %d，实际 %v", len(png), m["size"])
+	}
+	if m["source"] != "my-pc" {
+		t.Errorf("source 不符：%v", m["source"])
+	}
+}
+
+// 图片记录**没有 text 值**（插件端直接省略这个键）。
+//
+// 这是必须单独钉住的一条：早先 decodeProfile 只认 text 键，
+// 遇到图片 JSON 会掉进「旧版纯文本兼容」分支，把整段 JSON 当剪贴板文本写回本地。
+func TestDecodeImageProfile(t *testing.T) {
+	// 插件写法：完全没有 text 键
+	prof, plain, ok := decodeProfile([]byte(`{"type":"image","hash":"h","has_data":true,"data_name":"abc.png","size":123,"source":"phone"}`))
+	if !ok || plain {
+		t.Fatalf("图片 JSON 应被认成 Profile：ok=%v plain=%v", ok, plain)
+	}
+	if !prof.HasData || prof.DataName == nil || *prof.DataName != "abc.png" || prof.Size != 123 {
+		t.Errorf("图片记录解析结果不符：%+v", prof)
+	}
+	if prof.Text != "" {
+		t.Errorf("图片记录的 text 应为空，实际 %q", prof.Text)
+	}
+
+	// 本项目写法：text 是空串
+	prof, plain, ok = decodeProfile([]byte(`{"type":"image","hash":"h","text":"","has_data":true,"data_name":"abc.png","size":123}`))
+	if !ok || plain || !prof.HasData {
+		t.Fatalf("带空 text 的图片 JSON 也应被认成 Profile：ok=%v plain=%v %+v", ok, plain, prof)
+	}
+
+	// 反向哨兵：普通 JSON 对象（没有 Profile 特征字段）不能被当成 Profile
+	if _, plain, ok := decodeProfile([]byte(`{"foo":1}`)); !ok || !plain {
+		t.Errorf("非 Profile 的 JSON 应退回纯文本兼容：ok=%v plain=%v", ok, plain)
+	}
+}
+
+// 附件 URL：{剪贴板文件所在目录}/blobs/{名字}，非法名字一律拒绝。
+func TestBuildBlobURL(t *testing.T) {
+	const file = "https://host/dav/xime/clipboard/current.json"
+	got, ok := buildBlobURL(file, "abc123.png")
+	if !ok || got != "https://host/dav/xime/clipboard/blobs/abc123.png" {
+		t.Errorf("buildBlobURL = (%q, %v)", got, ok)
+	}
+	// 用户的「远程路径」自定义到别处时，blobs 跟着那个目录走
+	if got, ok := buildBlobURL("https://host/dav/rime/clip/1.json", "a.png"); !ok ||
+		got != "https://host/dav/rime/clip/blobs/a.png" {
+		t.Errorf("自定义路径下 buildBlobURL = (%q, %v)", got, ok)
+	}
+
+	// 路径穿越 / 空名 / 路径分隔符必须被白名单挡住
+	for _, bad := range []string{"", "..", "../evil", "a/b.png", "/abs.png", ".hidden", "a\\b.png", "a b.png"} {
+		if got, ok := buildBlobURL(file, bad); ok {
+			t.Errorf("非法附件名 %q 不该被接受，得到 %q", bad, got)
+		}
+	}
+}
+
+// blobsDirURL 只要目录本身，用于配置阶段「先把目录建好」。
+func TestBlobsDirURL(t *testing.T) {
+	got, ok := blobsDirURL("https://host/dav/xime/clipboard/current.json")
+	if !ok || got != "https://host/dav/xime/clipboard/blobs" {
+		t.Errorf("blobsDirURL = (%q, %v)", got, ok)
+	}
+	// 自定义嵌套路径时跟着走
+	if got, ok := blobsDirURL("https://host/dav/rime/clip/1.json"); !ok ||
+		got != "https://host/dav/rime/clip/blobs" {
+		t.Errorf("自定义路径下 blobsDirURL = (%q, %v)", got, ok)
+	}
+	// 和 buildBlobURL 必须拼出同一个前缀，否则「建目录」和「写附件」会各说各话
+	blob, _ := buildBlobURL("https://host/dav/xime/clipboard/current.json", "a.png")
+	if dir, _ := blobsDirURL("https://host/dav/xime/clipboard/current.json"); blob != dir+"/a.png" {
+		t.Errorf("blobsDirURL(%q) 与 buildBlobURL(%q) 前缀不一致", dir, blob)
+	}
+}
+
+// relativePathParts 把 URL 当目录拆；relativeDirParts 先剥掉文件名再拆。
+func TestRelativePathParts(t *testing.T) {
+	const base = "https://host/dav/"
+	if got := relativePathParts(base, "https://host/dav/xime/clipboard/blobs"); len(got) != 3 ||
+		got[0] != "xime" || got[1] != "clipboard" || got[2] != "blobs" {
+		t.Errorf("relativePathParts(目录) = %v，期望 [xime clipboard blobs]", got)
+	}
+	// 同一个 URL 交给 relativeDirParts，应少一层（剥掉最后一段）
+	if got := relativeDirParts(base, "https://host/dav/xime/clipboard/blobs"); len(got) != 2 ||
+		got[0] != "xime" || got[1] != "clipboard" {
+		t.Errorf("relativeDirParts(目录) = %v，期望 [xime clipboard]", got)
+	}
+	// davURL 之后没有目录层级时返回空
+	if got := relativePathParts(base, "https://host/dav"); len(got) != 0 {
+		t.Errorf("根目录场景 relativePathParts = %v，期望空", got)
+	}
+}
+
+func TestContentTypeOf(t *testing.T) {
+	cases := map[string]string{
+		"a.png":    "image/png",
+		"a.PNG":    "image/png",
+		"a.jpg":    "image/jpeg",
+		"a.jpeg":   "image/jpeg",
+		"a.webp":   "image/webp",
+		"a.bmp":    "image/bmp",
+		"a.bin":    "application/octet-stream",
+		"noext":    "application/octet-stream",
+		"a.tar.gz": "application/octet-stream",
+	}
+	for name, want := range cases {
+		if got := contentTypeOf(name); got != want {
+			t.Errorf("contentTypeOf(%q) = %q，期望 %q", name, got, want)
+		}
+	}
+}
+
+// 本地复制一张图片 → 远端应同时出现 blob 与 JSON，且**顺序是先 blob 后 JSON**。
+//
+// 顺序反了会留下「JSON 指向不存在 blob」的悬空引用，对端会反复下载失败。
+func TestPushImageToRemote(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	engine.syncCycle(true) // 建立基线（远端为空）
+
+	png := makeNoisePNG(t, 16, 16)
+	clip.setImage(png)
+	engine.checkLocalOnly()
+
+	// JSON 已写入，且是图片记录
+	content, ok := fake.file(remoteFilePath)
+	if !ok {
+		t.Fatal("图片没有推送到远端")
+	}
+	prof, plain, ok := decodeProfile([]byte(content))
+	if !ok || plain || !prof.HasData {
+		t.Fatalf("远端不是图片记录：ok=%v plain=%v %s", ok, plain, content)
+	}
+	if prof.DataName == nil {
+		t.Fatal("图片记录缺少 data_name")
+	}
+
+	// blob 内容与本地 PNG 逐字节一致
+	stored, ok := fake.blob(blobPath(*prof.DataName))
+	if !ok {
+		t.Fatalf("远端附件不存在：%s", *prof.DataName)
+	}
+	if !bytes.Equal(stored, png) {
+		t.Errorf("远端附件与本地图片不一致（%d vs %d 字节）", len(stored), len(png))
+	}
+	if prof.Size != len(png) {
+		t.Errorf("记录里的 size 应为 %d，实际 %d", len(png), prof.Size)
+	}
+
+	// 顺序：blob 必须在 JSON 之前
+	puts := fake.puts()
+	if len(puts) < 2 {
+		t.Fatalf("PUT 次数太少：%v", puts)
+	}
+	if puts[0] != blobPath(*prof.DataName) || puts[1] != remoteFilePath {
+		t.Errorf("必须先 PUT blob 再 PUT JSON，实际顺序 %v", puts)
+	}
+
+	// 界面上「本地内容」应显示为图片，而不是空文本
+	if st := engine.Status(); st.CurrentKind != kindImage || st.CurrentImageBytes != len(png) {
+		t.Errorf("状态里的图片信息不符：kind=%q bytes=%d", st.CurrentKind, st.CurrentImageBytes)
+	}
+}
+
+// 远端来了一张图 → 写进本地剪贴板；同一张图不重复写（回声抑制）。
+func TestPullImageToClipboard(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	engine.syncCycle(true)
+
+	png := makeNoisePNG(t, 16, 16)
+	prof := newImageProfile(png, "phone")
+	body, err := prof.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.setFile(remoteFilePath, string(body))
+	fake.setFileBytes(blobPath(*prof.DataName), png)
+
+	engine.syncCycle(true)
+	if got := clip.getImage(); !bytes.Equal(got, png) {
+		t.Fatalf("远端图片没有写进剪贴板（得到 %d 字节）", len(got))
+	}
+	if got := clip.get(); got != "" {
+		t.Errorf("图片记录不该产生文本，实际 %q", got)
+	}
+
+	// 回声抑制：同一张图反复轮询不得重复写剪贴板
+	writesBefore := clip.sets()
+	for i := 0; i < 3; i++ {
+		engine.syncCycle(true) // force：绕过 ETag，逼它真的重新比对
+	}
+	if after := clip.sets(); after != writesBefore {
+		t.Errorf("同一张图被重复写入剪贴板：%d → %d", writesBefore, after)
+	}
+
+	// 远端换成另一张图 → 应重新应用
+	other := makeNoisePNG(t, 12, 12)
+	otherProf := newImageProfile(other, "phone")
+	otherBody, _ := otherProf.encode()
+	fake.setFile(remoteFilePath, string(otherBody))
+	fake.setFileBytes(blobPath(*otherProf.DataName), other)
+	engine.syncCycle(true)
+	if got := clip.getImage(); !bytes.Equal(got, other) {
+		t.Error("远端换成新图片后没有更新剪贴板")
+	}
+}
+
+// 拉取到的附件不是合法图片时必须报错跳过，不能把坏字节塞进剪贴板。
+func TestPullCorruptBlobIsRejected(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	engine.syncCycle(true)
+
+	fake.setFile(remoteFilePath, `{"type":"image","hash":"h","has_data":true,"data_name":"bad.png","size":3}`)
+	fake.setFileBytes(blobPath("bad.png"), []byte("nope"))
+	engine.syncCycle(true)
+
+	if clip.getImage() != nil {
+		t.Error("坏附件不该被写进剪贴板")
+	}
+	if st := engine.Status(); st.LastError == "" {
+		t.Error("坏附件应当留下错误信息")
+	}
+}
+
+// 父目录不存在时服务器返回 403（而不是 409/404），也要能自动建目录并重试成功。
+//
+// 这正是「上传附件失败（HTTP 403）」最可能的成因：远端还没有 blobs 目录，
+// 而部分服务器（坚果云 / 反向代理后的 WebDAV）用 403 而不是 409 表达
+// 「父目录不存在」。插件 main.ts 只兜了 409/404，所以这条路径此前是断的。
+func TestBlobUploadRecoversFrom403MissingDir(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+	fake.putMissingParentStatus = http.StatusForbidden
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	engine.syncCycle(true)
+
+	png := makeSolidPNG(t, 4, 4, color.NRGBA{G: 200, A: 255})
+	clip.setImage(png)
+	engine.checkLocalOnly()
+
+	prof := newImageProfile(png, "")
+	if _, ok := fake.file(blobPath(*prof.DataName)); !ok {
+		t.Fatal("403 之后应自动建目录并重试成功，附件却没上去")
+	}
+	if _, ok := fake.file(remoteFilePath); !ok {
+		t.Error("附件成功后应继续写 current.json")
+	}
+	if st := engine.Status(); st.LastError != "" {
+		t.Errorf("不该留下错误：%s", st.LastError)
+	}
+}
+
+// 403 且目录也建不起来时：错误信息要同时给出状态码含义和服务端原话，
+// 用户才能判断是「程序没建目录」还是「服务器不让写」。
+func TestUploadErrorCarriesServerMessage(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+	fake.putMissingParentStatus = http.StatusForbidden
+	fake.putMissingParentBody = "<D:error><D:quota-exceeded/></D:error>"
+	fake.mkcolStatus = http.StatusForbidden
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	clip.setImage(makeSolidPNG(t, 4, 4, color.NRGBA{B: 200, A: 255}))
+	err := engine.PushNow()
+	if err == nil {
+		t.Fatal("目录建不起来时推送应当失败")
+	}
+	msg := err.Error()
+	// 状态码、服务端原话、以及「建目录也失败了」三者都要在，缺一个用户就得靠猜
+	for _, want := range []string{"403", "quota-exceeded", "MKCOL"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息应包含 %q，实际：%s", want, msg)
+		}
+	}
+	// XML 尖括号不能原样进界面（会破坏排版），必须已被压平
+	if strings.Contains(msg, "<") || strings.Contains(msg, ">") {
+		t.Errorf("响应体里的尖括号应被压平，实际：%s", msg)
+	}
+}
+
+// 「测试连接」应顺手把远端目录建好（剪贴板目录 + blobs 附件目录），
+// 这样后续同步就不必再依赖「父目录不存在会返回哪个状态码」。
+func TestTestConnectionPreparesRemoteDirs(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	if err := TestConnection(testConfig(srv.URL), NewLogBuffer(10)); err != nil {
+		t.Fatalf("测试连接应成功：%v", err)
+	}
+	for _, dir := range []string{"/dav/xime", "/dav/xime/clipboard", "/dav/xime/clipboard/blobs"} {
+		if !fake.hasDir(dir) {
+			t.Errorf("测试连接后目录 %s 应已创建", dir)
+		}
+	}
+	// 只建目录，不写任何文件
+	if put, _ := fake.counts(); put != 0 {
+		t.Errorf("测试连接不该写文件，实际 PUT %d 次", put)
+	}
+
+	// 关键：目录就绪之后，即使服务器对缺失父目录回 403，推图也不该再失败。
+	// 这正是用户那次「上传附件失败（HTTP 403）」的场景。
+	fake.putMissingParentStatus = http.StatusForbidden
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	clip.setImage(makeSolidPNG(t, 4, 4, color.NRGBA{R: 120, A: 255}))
+	if err := engine.PushNow(); err != nil {
+		t.Fatalf("目录已就绪后推图应成功，却失败：%v", err)
+	}
+}
+
+// 目录建不起来时，测试连接要如实报错，并说清是「连上了、但准备目录失败」。
+func TestTestConnectionReportsDirFailure(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+	fake.mkcolStatus = http.StatusForbidden
+
+	err := TestConnection(testConfig(srv.URL), NewLogBuffer(10))
+	if err == nil {
+		t.Fatal("MKCOL 被拒时测试连接应当失败")
+	}
+	if !strings.Contains(err.Error(), "准备远端目录") {
+		t.Errorf("错误信息应说明是准备目录失败，实际：%v", err)
+	}
+}
+
+// 反复点「测试连接」不应有副作用：目录已存在时 MKCOL 返回 405，被当作成功。
+func TestTestConnectionIsIdempotent(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	for i := 0; i < 3; i++ {
+		if err := TestConnection(testConfig(srv.URL), NewLogBuffer(10)); err != nil {
+			t.Fatalf("第 %d 次测试连接应成功（目录已存在不算错）：%v", i+1, err)
+		}
+	}
+	if put, _ := fake.counts(); put != 0 {
+		t.Errorf("测试连接不该写文件，实际 PUT %d 次", put)
+	}
+}
+
+// 超过自动上限的图片不推送，但要计数供界面展示。
+func TestImageOversizeNotPushed(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	cfg := engine.Config()
+	cfg.MaxImageMB = 1 // 1 MB
+	engine.UpdateConfig(cfg)
+	engine.syncCycle(true)
+
+	// 小图：在 1 MB 内 → 应推送
+	small := makeSolidPNG(t, 2, 2, color.NRGBA{R: 255, A: 255})
+	if len(small) > 1<<20 {
+		t.Fatalf("测试前提不成立：小图 %d 字节已超过 1 MB", len(small))
+	}
+	clip.setImage(small)
+	engine.checkLocalOnly()
+	if _, ok := fake.file(remoteFilePath); !ok {
+		t.Fatal("上限内的图片应被推送")
+	}
+	if st := engine.Status(); st.ImageOversizeCount != 0 {
+		t.Errorf("不该有超限计数，实际 %d", st.ImageOversizeCount)
+	}
+
+	// 大图：超过 1 MB → 不推送，且计数
+	big := makeBigPNG(t, 1<<20)
+	if len(big) <= 1<<20 {
+		t.Fatalf("测试前提不成立：噪声图只有 %d 字节", len(big))
+	}
+	before, _ := fake.file(remoteFilePath)
+	clip.setImage(big)
+	engine.checkLocalOnly()
+	if after, _ := fake.file(remoteFilePath); after != before {
+		t.Error("超限图片不该推送到远端")
+	}
+	if st := engine.Status(); st.ImageOversizeCount != 1 {
+		t.Errorf("图片超限计数应为 1，实际 %d", st.ImageOversizeCount)
+	}
+
+	// 0 = 不限制。重新复制一次同样的图：序号没变的话本地检查会直接跳过，
+	// 测不到「上限为 0 会不会放行」。
+	cfg.MaxImageMB = 0
+	engine.UpdateConfig(cfg)
+	clip.setImage(big)
+	engine.checkLocalOnly()
+	if got, _ := fake.file(remoteFilePath); got == before {
+		t.Error("上限为 0 时不该限制图片体积")
+	}
+}
+
+// 手动推送用「手动图片上限」，可以突破自动上限；两个上限互不影响。
+func TestManualImagePushBypassesAutoLimit(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	cfg := engine.Config()
+	cfg.MaxImageMB = 1
+	cfg.ManualMaxImageMB = 4
+	engine.UpdateConfig(cfg)
+
+	big := makeBigPNG(t, 1<<20)
+	clip.setImage(big)
+
+	// 自动同步会跳过（超自动上限）
+	engine.checkLocalOnly()
+	if _, ok := fake.file(remoteFilePath); ok {
+		t.Error("超自动上限的图片不该被自动推送")
+	}
+
+	// 手动推送应成功
+	if err := engine.PushNow(); err != nil {
+		t.Fatalf("手动推送应能突破自动上限，却失败：%v", err)
+	}
+	if _, ok := fake.file(remoteFilePath); !ok {
+		t.Error("手动推送的图片没到远端")
+	}
+
+	// 超过「手动上限」时手动推送也要拦住，且说清是哪个上限
+	cfg.ManualMaxImageMB = 1
+	engine.UpdateConfig(cfg)
+	err := engine.PushNow()
+	if err == nil {
+		t.Fatal("超过手动图片上限时应被拦住")
+	}
+	if !strings.Contains(err.Error(), "手动推送上限") {
+		t.Errorf("报错要说明是哪个上限，实际 %q", err.Error())
+	}
+}
+
+// 图片同步关闭时：既不推图片，也不能把远端记录冲成空文本。
+func TestImageSyncDisabledLeavesRemoteAlone(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+
+	// 先让远端有一条文本记录
+	clip.set("原有文本")
+	engine.checkLocalOnly()
+	before, ok := fake.file(remoteFilePath)
+	if !ok {
+		t.Fatal("文本没推到远端")
+	}
+
+	cfg := engine.Config()
+	cfg.SyncImages = false
+	engine.UpdateConfig(cfg)
+
+	// 用户复制一张图片：剪贴板里没有文本
+	clip.setImage(makeNoisePNG(t, 8, 8))
+	engine.checkLocalOnly()
+
+	if after, _ := fake.file(remoteFilePath); after != before {
+		t.Errorf("图片同步关闭时不该改动远端记录：\n前 %s\n后 %s", before, after)
+	}
+	if got := clip.get(); got != "" {
+		t.Errorf("不该写入文本，实际 %q", got)
+	}
+
+	// 远端来一张图：关闭时也不该写进剪贴板。
+	// 先把本机剪贴板清空，否则「剪贴板里有图」是用户自己复制的那张，测不出远端有没有被应用。
+	if err := clip.SetText(""); err != nil {
+		t.Fatal(err)
+	}
+	png := makeNoisePNG(t, 8, 8)
+	prof := newImageProfile(png, "phone")
+	body, _ := prof.encode()
+	fake.setFile(remoteFilePath, string(body))
+	fake.setFileBytes(blobPath(*prof.DataName), png)
+	engine.syncCycle(true)
+	if clip.getImage() != nil {
+		t.Error("图片同步关闭时不该把远端图片写进剪贴板")
+	}
+}
+
+// 图片同步关闭 + 剪贴板是图片时，PushNow 要给出明确原因（而不是「没有文本」）。
+func TestManualPushImageWhenDisabled(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	cfg := engine.Config()
+	cfg.SyncImages = false
+	engine.UpdateConfig(cfg)
+
+	clip.setImage(makeNoisePNG(t, 8, 8))
+	err := engine.PushNow()
+	if err == nil {
+		t.Fatal("图片同步关闭时手动推送应报错")
+	}
+	if !strings.Contains(err.Error(), "图片同步已关闭") {
+		t.Errorf("报错应说明图片同步已关闭，实际 %q", err.Error())
+	}
+
+	// 既没文本也没图片：给出「没有可同步的内容」
+	empty := &fakeClipboard{}
+	engine2 := newTestEngine(t, srv, empty)
+	if err := engine2.PushNow(); err == nil {
+		t.Error("空剪贴板手动推送应报错")
+	}
+}
+
+// 图片相关的两条高频日志也要短（与文本的 ⬆/⬇ 同一标准）。
+func TestImageLogLinesAreShort(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine, lb := newTestEngineWithLog(t, srv, clip)
+	engine.syncCycle(true)
+
+	// 推一张
+	clip.setImage(makeNoisePNG(t, 16, 16))
+	engine.checkLocalOnly()
+
+	// 拉一张（带上来源设备）
+	png := makeNoisePNG(t, 12, 12)
+	prof := newImageProfile(png, "phone")
+	body, _ := prof.encode()
+	fake.setFile(remoteFilePath, string(body))
+	fake.setFileBytes(blobPath(*prof.DataName), png)
+	engine.syncCycle(true)
+
+	var pushLine, pullLine string
+	for _, l := range lb.Lines(LogSync, 0) {
+		if strings.HasPrefix(l.Text, "⬆") && strings.Contains(l.Text, "图片") {
+			pushLine = l.Text
+		}
+		if strings.HasPrefix(l.Text, "⬇") && strings.Contains(l.Text, "图片") {
+			pullLine = l.Text
+		}
+	}
+	if pushLine == "" || pullLine == "" {
+		t.Fatalf("没找到图片推/拉日志：%+v", lb.Lines(LogSync, 0))
+	}
+	for _, line := range []string{pushLine, pullLine} {
+		if n := len([]rune(line)); n > 24 {
+			t.Errorf("图片日志太长了（%d 字）：%q", n, line)
+		}
+	}
+}
+
+// 图片同步关闭后：复制图片既不推也不拉，且**不写日志**——
+// 这是用户自己在「同步设置」里的选择，反复解释「为什么没同步」只会把日志刷满。
+func TestImageSyncOffIsSilent(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine, lb := newTestEngineWithLog(t, srv, clip)
+
+	cfg := engine.Config()
+	cfg.SyncImages = false
+	engine.UpdateConfig(cfg)
+	engine.syncCycle(true)
+
+	// 本地复制一张图 → 不推、不记日志
+	before := len(lb.Lines(LogSync, 0))
+	clip.setImage(makeNoisePNG(t, 8, 8))
+	engine.checkLocalOnly()
+	if _, ok := fake.file(remoteFilePath); ok {
+		t.Error("图片同步关闭时不该把本地图片推到远端")
+	}
+	if after := len(lb.Lines(LogSync, 0)); after != before {
+		t.Errorf("图片同步关闭时不该写日志，却多了 %d 行：%+v",
+			after-before, lb.Lines(LogSync, 0)[before:])
+	}
+
+	// 远端是图片 → 不拉、也不记日志
+	// 先把剪贴板清空：上一步是测试自己往里放的图，不清掉的话「剪贴板里还有图」
+	// 这件事本身就来自测试自身，断言不出「远端那张图有没有被写进来」。
+	if err := clip.SetText(""); err != nil {
+		t.Fatal(err)
+	}
+	png := makeNoisePNG(t, 6, 6)
+	prof := newImageProfile(png, "phone")
+	body, _ := prof.encode()
+	fake.setFile(remoteFilePath, string(body))
+	fake.setFileBytes(blobPath(*prof.DataName), png)
+
+	before = len(lb.Lines(LogSync, 0))
+	engine.syncCycle(true)
+	if got := clip.getImage(); got != nil {
+		t.Error("图片同步关闭时不该把远端图片写进剪贴板")
+	}
+	if after := len(lb.Lines(LogSync, 0)); after != before {
+		t.Errorf("远端是图片时也不该写日志，却多了 %d 行：%+v",
+			after-before, lb.Lines(LogSync, 0)[before:])
+	}
+}
+
+// 图片配置项的默认值与钳制。
+func TestImageConfigDefaultsAndBounds(t *testing.T) {
+	d := defaultConfig()
+	if !d.SyncImages {
+		t.Error("图片同步默认应开启")
+	}
+	if d.MaxImageMB != defaultMaxImageMB {
+		t.Errorf("自动图片上限默认值应为 %d MB，实际 %d", defaultMaxImageMB, d.MaxImageMB)
+	}
+	if d.ManualMaxImageMB != defaultManualMaxImageMB {
+		t.Errorf("手动图片上限默认值应为 %d MB，实际 %d", defaultManualMaxImageMB, d.ManualMaxImageMB)
+	}
+	if d.ManualMaxImageMB <= d.MaxImageMB {
+		t.Errorf("手动图片上限（%d）应比自动（%d）宽，否则这个配置项没意义",
+			d.ManualMaxImageMB, d.MaxImageMB)
+	}
+
+	c := defaultConfig()
+	c.MaxImageMB = -5
+	c.ManualMaxImageMB = -5
+	c.normalize()
+	if c.MaxImageMB != 0 || c.ManualMaxImageMB != 0 {
+		t.Errorf("负数应归零（0 = 不限制）：%+v", c)
+	}
+
+	c = defaultConfig()
+	c.MaxImageMB = 999999
+	c.ManualMaxImageMB = 999999
+	c.normalize()
+	if c.MaxImageMB != maxImageMBLimit || c.ManualMaxImageMB != maxImageMBLimit {
+		t.Errorf("过大应收敛到 %d：%+v", maxImageMBLimit, c)
+	}
+
+	// 硬上限必须小于附件读取上限，否则用户把上限调满后图片推得上去、拉不回来
+	if maxImageMBLimit<<20 >= maxBlobResponseBytes {
+		t.Errorf("图片上限 %d MB 不应超过附件读取上限 %d 字节", maxImageMBLimit, maxBlobResponseBytes)
+	}
+
+	// 旧配置里没有这三个字段时，应拿到默认值（而不是 false / 0）
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	old := `{"davUrl":"https://host/dav/","remotePath":"xime/clipboard/current.json","enabled":true}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("读取旧配置失败：%v", err)
+	}
+	if !cfg.SyncImages || cfg.MaxImageMB != defaultMaxImageMB || cfg.ManualMaxImageMB != defaultManualMaxImageMB {
+		t.Errorf("旧配置升级后应拿到图片默认值：%+v", cfg)
+	}
+}
+
+// 旧配置（图片上限用 KB）应被自动换算成 MB，而不是悄悄回到默认值。
+func TestLegacyImageKBConfigMigratesToMB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	old := `{"davUrl":"https://host/dav/","syncImages":true,` +
+		`"maxImageKB":2048,"manualMaxImageKB":10240}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, warns, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("读取旧配置失败：%v", err)
+	}
+	if cfg.MaxImageMB != 2 {
+		t.Errorf("2048 KB 应换算成 2 MB，实际 %d", cfg.MaxImageMB)
+	}
+	if cfg.ManualMaxImageMB != 10 {
+		t.Errorf("10240 KB 应换算成 10 MB，实际 %d", cfg.ManualMaxImageMB)
+	}
+	// 用户得知道文件被改过，否则会以为设置自己变了
+	joined := strings.Join(warns, "；")
+	if !strings.Contains(joined, "KB") || !strings.Contains(joined, "MB") {
+		t.Errorf("应提示单位已换算，实际 warnings=%v", warns)
+	}
+
+	// 换算结果要落盘：再读一次应直接是 MB，且旧键不再出现
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "maxImageKB") {
+		t.Errorf("旧键应已从文件里消失：%s", raw)
+	}
+	cfg2, _, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.MaxImageMB != 2 || cfg2.ManualMaxImageMB != 10 {
+		t.Errorf("二次读取应保持换算后的值：%+v", cfg2)
+	}
+
+	// 新键已存在时以新键为准，不被旧键覆盖
+	both := `{"davUrl":"https://host/dav/","maxImageMB":7,` +
+		`"manualMaxImageMB":9,"maxImageKB":1024,"manualMaxImageKB":1024}`
+	if err := os.WriteFile(path, []byte(both), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg3, _, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg3.MaxImageMB != 7 || cfg3.ManualMaxImageMB != 9 {
+		t.Errorf("新旧键都在时应以新键为准：%+v", cfg3)
+	}
+}
+
+// kbToMB 的边界：0 保持 0（= 不限制），正数向上取整到至少 1 MB。
+func TestKBToMBBoundaries(t *testing.T) {
+	for _, tc := range []struct{ kb, want int }{
+		{0, 0}, {-1, 0}, {1, 1}, {1023, 1}, {1024, 1}, {1025, 2}, {10240, 10},
+	} {
+		if got := kbToMB(tc.kb); got != tc.want {
+			t.Errorf("kbToMB(%d) = %d，期望 %d", tc.kb, got, tc.want)
+		}
+	}
+}
+
+// 图片上限的单位是 MB：1 MB 应换算成 1<<20 字节。
+func TestImageLimitUnitIsMB(t *testing.T) {
+	srv := httptest.NewServer(newFakeWebDAV())
+	defer srv.Close()
+	fake := srv.Config.Handler.(*fakeWebDAV)
+
+	clip := &fakeClipboard{}
+	engine := newTestEngine(t, srv, clip)
+	cfg := engine.Config()
+	cfg.MaxImageMB = 1
+	engine.UpdateConfig(cfg)
+	engine.syncCycle(true)
+
+	// 约 16 KB 的图，远小于 1 MB，必须推送
+	small := makeNoisePNG(t, 64, 64)
+	if len(small) >= 1<<20 {
+		t.Fatalf("测试前提不成立：%d 字节", len(small))
+	}
+	clip.setImage(small)
+	engine.checkLocalOnly()
+	if _, ok := fake.file(remoteFilePath); !ok {
+		t.Error("远小于上限的图片应被推送（单位换算写错了？）")
+	}
+}

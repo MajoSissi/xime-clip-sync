@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "1.3.0"
+const version = "1.5.0"
 
 func main() {
 	var (
@@ -93,7 +93,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "连接测试失败：%v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("连接测试成功")
+		fmt.Println("连接测试成功，远端目录已就绪")
 		return
 	}
 	if *once != "" {
@@ -297,14 +297,14 @@ func startTray(ctx context.Context, engine *SyncEngine, cfgPath string, uiStatus
 		Push: func() {
 			// 成功不再单独打一行：pushRemote 已经记了「⬆ 推送（N 字符）」。
 			if err := engine.PushNow(); err != nil {
-				log.Errorf("手动推送失败：%v", err)
+				log.SyncErrorf("手动推送失败：%v", err)
 			}
 		},
 		Pull: func() {
 			// 成功不再单独打一行：有变化时 pullRemote 记「⬇ 拉取（N 字符）」。
 			// 没变化就什么都不记——这条路径每个轮询周期都会走，不能刷屏。
 			if err := engine.PullNow(); err != nil {
-				log.Errorf("手动拉取失败：%v", err)
+				log.SyncErrorf("手动拉取失败：%v", err)
 			}
 		},
 		Quit: quit,

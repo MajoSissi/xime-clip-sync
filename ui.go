@@ -212,12 +212,17 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if err := TestConnection(cfg, s.log); err != nil {
-			s.log.Errorf("连接测试失败：%v", err)
+			// 走同步通道：连接测试就是在验同步通道能不能用，
+			// 失败原因（认证、目录、限流）正是「同步日志」里该出现的东西。
+			s.log.SyncErrorf("连接测试失败：%v", err)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		s.log.Infof("连接测试成功：%s", cfg.DavURL)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "连接成功，服务器可访问"})
+		s.log.SyncInfof("连接测试成功，远端目录已就绪：%s", cfg.DavURL)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"message": "连接成功，远端目录已就绪",
+		})
 	}))
 
 	// 推送（界面左下角「推送」按钮 / 托盘菜单「推送」）
@@ -246,9 +251,9 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已拉取远端剪贴板"})
 	}))
 
-	// 日志
+	// 日志（两条通道各自返回，界面上各占一块面板）
 	mux.HandleFunc("/api/logs", localOnly(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"lines": s.log.Lines(300)})
+		writeJSON(w, http.StatusOK, s.log.LinesByKind(300))
 	}))
 
 	// 日志实时推送（SSE）

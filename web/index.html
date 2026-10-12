@@ -193,7 +193,9 @@
 
   /* ---------- 状态 ---------- */
   .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .stats.counters { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 10px; }
+  /* 计数器从 3 个变成 4 个：用 auto-fit，宽了排成一行、窄了自动折成两行，
+     不用为「多一个格子」再调一次断点。 */
+  .stats.counters { grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); margin-top: 10px; }
   .stat {
     background: var(--panel-2); border: 1px solid var(--border-soft);
     border-radius: 8px; padding: 9px 12px; min-width: 0;
@@ -215,19 +217,21 @@
   }
 
   /* ---------- 日志 ---------- */
-  #logs {
+  /* 「运行状态」页只放同步日志——这一页是查「剪贴板为什么没同步过去」的地方。
+     程序日志（配置、界面、托盘）照常写进 logs/ 下的 .app.log，只是不上界面。 */
+  .logs {
     height: clamp(260px, calc(100vh - 240px), 720px);
     overflow-y: auto; resize: vertical;
     background: #12141a; border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 12px; font-family: Consolas, "Cascadia Mono", monospace;
     font-size: 12px; line-height: 1.7;
   }
-  #logs .ln { white-space: pre-wrap; word-break: break-all; }
-  #logs .t { color: #5f6b80; }
-  #logs .info { color: #a9b6cc; }
-  #logs .warn { color: var(--warn); }
-  #logs .error { color: #ff8b8b; }
-  #logs:empty::after { content: "暂无日志"; color: #4d586b; }
+  .logs .ln { white-space: pre-wrap; word-break: break-all; }
+  .logs .t { color: #5f6b80; }
+  .logs .info { color: #a9b6cc; }
+  .logs .warn { color: var(--warn); }
+  .logs .error { color: #ff8b8b; }
+  .logs:empty::after { content: "暂无日志"; color: #4d586b; }
 </style>
 </head>
 <body>
@@ -267,8 +271,7 @@
           <div class="help">
             远端文件路径，具体到文件，留空则为「xime/clipboard/current.json」
           </div>
-        </div>
-        <div class="row">
+        </div>        <div class="row">
           <div class="field">
             <label for="username">用户名</label>
             <input type="text" id="username" autocomplete="off">
@@ -288,7 +291,7 @@
         </label>
       </div>
       <div class="card-actions">
-        <button id="btnTest">测试连接</button>
+        <button id="btnTest" title="顺便在远端建好所需目录（剪贴板目录 + blobs 附件目录），之后同步就不必再建">测试连接</button>
         <div id="testToast" class="toast"></div>
       </div>
     </section>
@@ -300,15 +303,30 @@
           <input type="checkbox" id="enabled">
           <span class="lbl">启用同步</span>
         </label>
+        <label class="check">
+          <input type="checkbox" id="syncImages">
+          <span class="lbl">同步图片（截图 / 位图，按 PNG 原图同步）</span>
+        </label>
         <div class="row">
           <div class="field">
-            <label for="maxTextChars">自动推送-文本长度上限（字符）</label>
+            <label for="maxTextChars">[文本] 自动推送-长度上限（字符）</label>
             <input type="number" id="maxTextChars" min="0" step="100" title="0 表示不限制">
           </div>
           <div class="field">
-            <label for="manualMaxTextChars">手动推送-文本长度上限上限（字符）</label>
+            <label for="manualMaxTextChars">[文本] 手动推送-长度上限（字符）</label>
             <input type="number" id="manualMaxTextChars" min="0" step="100"
                    title="托盘与右上角「推送」按钮用它，可以突破左边那个上限；0 表示不限制">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="maxImageMB">[图片] 自动推送-单张上限（MB）</label>
+            <input type="number" id="maxImageMB" min="0" max="50" step="1" title="0 表示不限制；最高 50">
+          </div>
+          <div class="field">
+            <label for="manualMaxImageMB">[图片] 手动推送-单张上限（MB）</label>
+            <input type="number" id="manualMaxImageMB" min="0" max="50" step="1"
+                   title="托盘与右上角「推送」按钮用它，可以突破左边那个上限；0 表示不限制；最高 50">
           </div>
         </div>
         <div class="row">
@@ -326,7 +344,7 @@
 
   </div>
 
-  <!-- ================= 页二：运行状态 + 运行日志 ================= -->
+  <!-- ================= 页二：运行状态 + 同步日志 ================= -->
   <div class="page status" id="page-status">
 
     <section>
@@ -338,7 +356,8 @@
       <div class="stats counters">
         <div class="stat"><div class="k">推送次数</div><div class="v" id="pushCount">0</div></div>
         <div class="stat"><div class="k">应用远端</div><div class="v" id="pullCount">0</div></div>
-        <div class="stat"><div class="k">超长跳过</div><div class="v" id="oversizeCount">0</div></div>
+        <div class="stat"><div class="k">文本超限</div><div class="v" id="oversizeCount">0</div></div>
+        <div class="stat"><div class="k">图片超限</div><div class="v" id="imageOversizeCount">0</div></div>
       </div>
 
       <div class="previews">
@@ -359,9 +378,11 @@
       <div id="hashWarn" class="toast bad"></div>
     </section>
 
+    <!-- 只有同步日志：剪贴板的推与拉、连接测试、限流退避、上传下载失败。
+         程序自身的日志（配置、界面、托盘）一律不往这块里放。 -->
     <section>
-      <h2>运行日志</h2>
-      <div id="logs"></div>
+      <h2>同步日志</h2>
+      <div id="syncLogs" class="logs"></div>
     </section>
 
   </div>
@@ -442,11 +463,13 @@
 const $ = (id) => document.getElementById(id);
 
 const FIELDS = ["davUrl","remotePath","username","password","deviceName","pollSeconds",
-                "localPollSeconds","maxTextChars","manualMaxTextChars","enabled","insecureSkipVerify",
+                "localPollSeconds","maxTextChars","manualMaxTextChars",
+                "syncImages","maxImageMB","manualMaxImageMB","enabled","insecureSkipVerify",
                 "proxyMode","proxyUrl",
                 "autostart","logToFile","logRetainDays","logMaxFileMB","uiPort"];
-const BOOLS = ["enabled","insecureSkipVerify","autostart","logToFile"];
-const NUMS = ["pollSeconds","localPollSeconds","maxTextChars","manualMaxTextChars","logRetainDays","logMaxFileMB","uiPort"];
+const BOOLS = ["enabled","syncImages","insecureSkipVerify","autostart","logToFile"];
+const NUMS = ["pollSeconds","localPollSeconds","maxTextChars","manualMaxTextChars",
+              "maxImageMB","manualMaxImageMB","logRetainDays","logMaxFileMB","uiPort"];
 const TABS = ["sync","status","app"];
 
 // 把文本放进 innerHTML 前转义。提示文案里可能夹着系统错误信息，
@@ -454,6 +477,15 @@ const TABS = ["sync","status","app"];
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+// 把字节数渲染成「12 KB / 1.5 MB」这样的短标签（状态区显示图片体积用）。
+// 与后端的 humanBytes 口径一致，只是这里保留一位小数，避免 1.5 MB 被显示成 1 MB。
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n >= 1048576) return (n / 1048576).toFixed(1).replace(/\.0$/, "") + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
 }
 
 // 顶栏操作（保存 / 推送 / 拉取）的反馈：浮在按钮下方，6 秒后自己消失。
@@ -491,7 +523,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
   // 日志框在隐藏状态下量不出高度，切回来时补一次滚到底
   if (name === "status") {
-    const box = $("logs");
+    const box = $("syncLogs");
     box.scrollTop = box.scrollHeight;
   }
 }
@@ -552,8 +584,19 @@ function renderStatus(st) {
   $("pushCount").textContent = st.pushCount;
   $("pullCount").textContent = st.pullCount;
   $("oversizeCount").textContent = st.oversizeCount || 0;
-  $("curText").textContent = st.currentText || "（空）";
-  $("remText").textContent = st.remoteExists ? (st.remoteText || "（空）") : "（远端暂无文件）";
+  $("imageOversizeCount").textContent = st.imageOversizeCount || 0;
+
+  // 「内容」一栏按类型渲染：图片没有文本可看，显示体积更有用。
+  $("curText").textContent = st.currentKind === "image"
+    ? "🖼 图片（" + fmtBytes(st.currentImageBytes) + "）"
+    : (st.currentText || "（空）");
+  if (!st.remoteExists) {
+    $("remText").textContent = "（远端暂无文件）";
+  } else if (st.remoteKind === "image") {
+    $("remText").textContent = "🖼 图片（" + fmtBytes(st.remoteImageBytes) + "）";
+  } else {
+    $("remText").textContent = st.remoteText || "（空）";
+  }
   $("remRaw").textContent = st.remoteRaw || "（尚未读取）";
 
   // 配置界面地址跟着端口走，放在「程序设置 · 配置界面」里，可以点开/复制。
@@ -573,8 +616,20 @@ function renderStatus(st) {
   }
 }
 
+// 日志面板最多保留多少行（服务端也是按这个数量给的）
+const LOG_LIMIT = 300;
+
+// 界面只展示同步通道，值必须与服务端 LogLine.kind 的 LogSync 一致。
+//
+// 程序日志（配置、界面、托盘、自启）照常写进 logs/ 下的 .app.log 供排查，
+// 只是不占「运行状态」页——那一页是用来查「剪贴板为什么没同步过去」的。
+const LOG_KIND = "sync";
+
+// addLog 把一条日志放进面板；不属于本面板通道的直接丢掉。
 function addLog(line) {
-  const box = $("logs");
+  if (line.kind !== LOG_KIND) return;
+  const box = $("syncLogs");
+  if (!box) return;
   const div = document.createElement("div");
   div.className = "ln";
   const t = document.createElement("span");
@@ -585,7 +640,7 @@ function addLog(line) {
   c.textContent = line.text;
   div.append(t, c);
   box.appendChild(div);
-  while (box.childElementCount > 300) box.removeChild(box.firstChild);
+  while (box.childElementCount > LOG_LIMIT) box.removeChild(box.firstChild);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -621,8 +676,9 @@ async function init() {
   showTab(location.hash.slice(1));
 
   fillForm(await api("/api/config"));
+  // /api/logs 两条通道都给，addLog 只挑同步通道那一份渲染
   const logs = await api("/api/logs");
-  (logs.lines || []).forEach(addLog);
+  (logs.sync || []).forEach(addLog);
 
   const es = new EventSource("/api/events");
   es.addEventListener("status", (e) => renderStatus(JSON.parse(e.data)));

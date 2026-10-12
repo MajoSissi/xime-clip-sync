@@ -55,6 +55,21 @@ type Config struct {
 	// 手动触发是用户的明确意图，允许突破自动同步的上限（偶尔确实要把一段长文本强推过去）；
 	// 0 表示不限制。
 	ManualMaxTextChars int `json:"manualMaxTextChars"`
+	// SyncImages 是否同步剪贴板里的图片（位图按 PNG 原图同步到远端 blobs 目录）。
+	//
+	// 默认**开启**：图片是剪贴板的常见内容，插件端（webdav-clipboard-sync）声明了
+	// attachments 能力，协议上早就有 blobs 目录，打开即可用。关掉后图片既不上传也不下载。
+	SyncImages bool `json:"syncImages"`
+	// MaxImageMB 是**自动**推送的单张图片大小上限（MB）。超过这个体积的图片自动同步不推送；
+	// 0 表示不限制。上限按**推送出去的 PNG 字节数**算，也就是真正写进远端的那个体积
+	// （剪贴板原始位图是未压缩的，比它大得多，拿它当判据会误伤）。
+	//
+	// 单位是 MB 而不是 KB：这个数字是给用户看的，而截图常见几百 KB 到几 MB，
+	// 「MB」既好读又不用对着 10240 数位数。旧配置里的 maxImageKB 会自动换算（见 loadConfig）。
+	MaxImageMB int `json:"maxImageMB"`
+	// ManualMaxImageMB 是**手动**推送（托盘 / 界面「推送」按钮）的单张图片大小上限（MB）。
+	// 与文本一样，手动触发允许突破自动同步的上限；0 表示不限制。
+	ManualMaxImageMB int `json:"manualMaxImageMB"`
 	// 是否把日志写入 logs/ 目录（无控制台构建下排查问题的唯一途径）
 	LogToFile bool `json:"logToFile"`
 	// 日志保留天数（含今天）；0 表示永久保留、不自动清理
@@ -83,6 +98,32 @@ const (
 	defaultLogFileMB  = defaultMaxLogFileBytes >> 20
 	maxLogFileMBLimit = 1024 // 1 GB，再大就不是「限制」了
 )
+
+// 单张图片大小上限（MB）的默认值与硬上限。
+const (
+	// 自动推送：出厂 1 MB。够覆盖绝大多数截图（常见 100 KB ~ 800 KB）。
+	defaultMaxImageMB = 1
+	// 手动推送：出厂 10 MB。偶尔要把一张大图强推过去时够用。
+	defaultManualMaxImageMB = 10
+	// maxImageMBLimit 是用户能配的最大值。它必须**小于** webdav.go 的
+	// maxBlobResponseBytes：超过读取上限的图片即使推得上去，拉取端也会被截断成坏文件，
+	// 用户只会看到「限制明明够用、却同步不过去」。当前是 50 MB 对 64 MiB。
+	maxImageMBLimit = 50
+)
+
+// kbToMB 把旧配置里的 KB 上限换算成 MB。
+//
+// 向上取整：MB 粒度表达不了 1 KB，而把 1 KB 取整成 0 会被理解成「不限制」——
+// 那是把限制**放宽**了，方向错了。所以宁可取整到 1 MB。0 保持 0（两种单位下都表示不限）。
+func kbToMB(kb int) int {
+	if kb <= 0 {
+		return 0
+	}
+	if mb := (kb + 1023) / 1024; mb > 0 {
+		return mb
+	}
+	return 1
+}
 
 // 配置界面默认监听端口。
 //
@@ -141,10 +182,15 @@ func defaultConfig() Config {
 		// 比自动同步的 300 宽得多，能应付「偶尔要把长文本强推过去」，
 		// 又不至于一次把几 MB 的内容塞进远端文件。
 		ManualMaxTextChars: 10000,
-		LogToFile:          true,
-		LogRetainDays:      7,
-		LogMaxFileMB:       defaultLogFileMB,
-		UIPort:             defaultUIPort,
+		// 图片默认开启：插件端声明了 attachments 能力，协议上已支持；
+		// 两个体积上限给了「默认可用但不至于把几 MB 的图塞进远端」的边界。
+		SyncImages:       true,
+		MaxImageMB:       defaultMaxImageMB,
+		ManualMaxImageMB: defaultManualMaxImageMB,
+		LogToFile:        true,
+		LogRetainDays:    7,
+		LogMaxFileMB:     defaultLogFileMB,
+		UIPort:           defaultUIPort,
 		// 默认跟随系统代理：Windows 桌面程序就是这么被期望的。
 		// 系统没配代理时它等价于直连，所以这个默认值不会凭空改变出网路径。
 		ProxyMode: ProxyModeSystem,
@@ -238,6 +284,20 @@ func (c *Config) normalize() {
 	// 负数视为非法（手改配置）；0 是合法值，含义是「不限制」
 	if c.ManualMaxTextChars < 0 {
 		c.ManualMaxTextChars = 0
+	}
+	// 图片体积上限同理：0 = 不限制，负数归零，过大收敛到硬上限
+	// （超过硬上限的图拉取端读不全，存着只会让用户以为限制生效了、实际同步不过去）。
+	if c.MaxImageMB < 0 {
+		c.MaxImageMB = 0
+	}
+	if c.MaxImageMB > maxImageMBLimit {
+		c.MaxImageMB = maxImageMBLimit
+	}
+	if c.ManualMaxImageMB < 0 {
+		c.ManualMaxImageMB = 0
+	}
+	if c.ManualMaxImageMB > maxImageMBLimit {
+		c.ManualMaxImageMB = maxImageMBLimit
 	}
 	if c.LogRetainDays < 0 {
 		c.LogRetainDays = 0
@@ -367,6 +427,32 @@ func loadConfig(path string) (Config, []string, error) {
 	case !missing:
 		return cfg, nil, err
 	}
+
+	// 图片上限的单位在 v1.4.1 从 KB 改成了 MB。老配置里还留着 maxImageKB /
+	// manualMaxImageKB 时，就地换算一次并标记「需要重写文件」——
+	// 否则用户自己调过的值会悄无声息地回到默认，他只会觉得「设置自己丢了」。
+	//
+	// 只在**新键没写**时才迁移：两个键都在的话以新的为准，不覆盖用户的最新意图。
+	legacyImageUnit := false
+	if err == nil {
+		var probe struct {
+			MaxImageMB       *int `json:"maxImageMB"`
+			ManualMaxImageMB *int `json:"manualMaxImageMB"`
+			MaxImageKB       *int `json:"maxImageKB"`
+			ManualMaxImageKB *int `json:"manualMaxImageKB"`
+		}
+		if json.Unmarshal(data, &probe) == nil {
+			if probe.MaxImageMB == nil && probe.MaxImageKB != nil {
+				cfg.MaxImageMB = kbToMB(*probe.MaxImageKB)
+				legacyImageUnit = true
+			}
+			if probe.ManualMaxImageMB == nil && probe.ManualMaxImageKB != nil {
+				cfg.ManualMaxImageMB = kbToMB(*probe.ManualMaxImageKB)
+				legacyImageUnit = true
+			}
+		}
+	}
+
 	cfg.normalize()
 
 	// 配置不见了、但日志还在 → 多半是被删除或移走了，不是真的首次运行。
@@ -388,6 +474,10 @@ func loadConfig(path string) (Config, []string, error) {
 		if rewritePwd {
 			changes = append(changes, "检测到配置里的明文密码，已改为加密保存")
 		}
+	}
+
+	if legacyImageUnit {
+		changes = append(changes, "图片上限的单位已由 KB 改为 MB，旧值已自动换算")
 	}
 
 	// 文件里没写端口（或写的是 0/越界值）时要补一个默认端口进文件。

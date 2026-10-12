@@ -22,6 +22,13 @@ const (
 	rawPreviewLen = 400
 )
 
+// 剪贴板内容的两种形态。current/remote 的「已达成一致」状态要带上类型，
+// 否则「文本为空」和「是图片」会混在一起，导致远端图片被反复当成新内容重下。
+const (
+	kindText  = "text"
+	kindImage = "image"
+)
+
 // runeCount 返回字符数（不是字节数）。
 // 用户看到的是「多少字」，所以长度上限也按字符算，而不是 UTF-8 字节。
 func runeCount(s string) int { return len([]rune(s)) }
@@ -50,6 +57,14 @@ type Status struct {
 	BackoffUntil  string `json:"backoffUntil"`
 	DeviceName    string `json:"deviceName"`
 	Autostart     bool   `json:"autostart"`
+
+	// 图片相关。Kind 是 "" / text / image，界面上据此把「内容」一栏渲染成文本或图片尺寸；
+	// *ImageBytes 是「已达成一致」的那张图的字节数（Kind 不是 image 时为 0）。
+	CurrentKind        string `json:"currentKind"`
+	RemoteKind         string `json:"remoteKind"`
+	CurrentImageBytes  int    `json:"currentImageBytes"`
+	RemoteImageBytes   int    `json:"remoteImageBytes"`
+	ImageOversizeCount int    `json:"imageOversizeCount"`
 }
 
 // SyncEngine 负责「本地剪贴板 ↔ 远端 current.json」的双向同步。
@@ -79,6 +94,17 @@ type SyncEngine struct {
 	hashMismatch bool
 	hashWarned   bool
 
+	// 图片的「已达成一致」状态，与上面的 current 并列。
+	// currentKind 指明当前一致的是哪一种内容：文本用 current 比，图片用 currentImageHash 比。
+	// 图片不能只靠「文本相等」判重——图片记录的 text 恒为空串，
+	// 拿它比的话任何一次本地图片变更都会被误判成「和远端一致」而漏推。
+	currentKind      string
+	currentImageHash string
+	currentImageSize int
+	// 远端那边是什么内容（用于界面展示，以及判断要不要下载附件）
+	remoteKind      string
+	remoteImageSize int
+
 	localSeq  uint32
 	seqPrimed bool
 	hasSeq    bool
@@ -95,6 +121,10 @@ type SyncEngine struct {
 	// 上一次因超长被跳过的文本。只用于「同一条超长内容只告警一次」——
 	// 超长内容**不写进 current**（理由见 checkLocal 里的说明）。
 	oversizeText string
+
+	// 图片因超过体积上限被跳过推送的次数，以及「同一张图只告警一次」的去重值
+	imageOversize     int
+	oversizeImageHash string
 
 	wake chan struct{}
 }
@@ -128,7 +158,7 @@ func (e *SyncEngine) UpdateConfig(cfg Config) {
 	e.mu.Unlock()
 	// 记的是**实际生效**的远程路径：留空时会显示默认值，
 	// 这样日志里的这一行能直接对上「远端文件」那一行。
-	e.log.Infof("配置已更新：%s（远程路径 %q，轮询 %ds）", cfg.DavURL, cfg.RemotePathOrDefault(), cfg.PollSeconds)
+	e.log.SyncInfof("配置已更新：%s（远程路径 %q，轮询 %ds）", cfg.DavURL, cfg.RemotePathOrDefault(), cfg.PollSeconds)
 	e.Wake()
 }
 
@@ -160,7 +190,7 @@ func (e *SyncEngine) setError(err error) {
 	e.lastErrLog = msg
 	e.mu.Unlock()
 	if shouldLog {
-		e.log.Errorf("%s", msg)
+		e.log.SyncErrorf("%s", msg)
 	}
 }
 
@@ -169,13 +199,6 @@ func (e *SyncEngine) clearError() {
 	e.lastError = ""
 	e.lastErrLog = ""
 	e.mu.Unlock()
-}
-
-// getCurrent 返回「两端已达成一致的内容」。
-func (e *SyncEngine) getCurrent() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.current
 }
 
 // shortHash 截断哈希值，便于在界面上展示。
@@ -214,7 +237,7 @@ func (e *SyncEngine) noteHash(prof Profile) {
 	e.mu.Unlock()
 
 	if first {
-		e.log.Warnf("对端 hash 与本地 SHA-256 不一致（远端 %s / 本地 %s），不影响同步",
+		e.log.SyncWarnf("对端 hash 与本地 SHA-256 不一致（远端 %s / 本地 %s），不影响同步",
 			shortHash(prof.Hash), shortHash(local))
 	}
 }
@@ -226,7 +249,7 @@ func (e *SyncEngine) backoff(d time.Duration, action string) {
 	e.backoffUntil = until
 	e.lastError = "服务器限流（HTTP 503），已暂停同步 " + d.String()
 	e.mu.Unlock()
-	e.log.Warnf("%s 遇到 503 限流，退避至 %s（坚果云免费版限 600 次/30 分钟）",
+	e.log.SyncWarnf("%s 遇到 503 限流，退避至 %s（坚果云免费版限 600 次/30 分钟）",
 		action, until.Format("15:04:05"))
 }
 
@@ -258,6 +281,12 @@ func (e *SyncEngine) Status() Status {
 		OversizeCount: e.oversize,
 		DeviceName:    e.cfg.DeviceName,
 		Autostart:     autostartEnabled(),
+
+		CurrentKind:        e.currentKind,
+		RemoteKind:         e.remoteKind,
+		CurrentImageBytes:  e.currentImageSize,
+		RemoteImageBytes:   e.remoteImageSize,
+		ImageOversizeCount: e.imageOversize,
 	}
 	if !e.lastPushAt.IsZero() {
 		st.LastPushAt = e.lastPushAt.Format("15:04:05")
@@ -301,7 +330,7 @@ func (e *SyncEngine) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			e.log.Infof("同步已停止")
+			e.log.SyncInfof("同步已停止")
 			return
 		case <-e.wake:
 			e.syncCycle(true)
@@ -338,7 +367,11 @@ func (e *SyncEngine) localInterval() time.Duration {
 // 再拉一次远端——远端有内容则远端优先，远端不存在则用本地播种。
 func (e *SyncEngine) prime() {
 	cfg := e.Config()
-	if text, err := e.clip.GetText(); err == nil {
+	text, err := e.clip.GetText()
+	switch {
+	case err != nil:
+		e.log.SyncWarnf("读取剪贴板失败：%v", err)
+	case text != "":
 		// 超长的剪贴板内容同样不当作基线（理由见 checkLocal）：
 		// 它不会被推送，就不该出现在界面的「本地内容」里。
 		if n := runeCount(text); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
@@ -346,27 +379,45 @@ func (e *SyncEngine) prime() {
 			e.oversizeText = text
 			e.oversize++
 			e.mu.Unlock()
-			e.log.Warnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
+			e.log.SyncWarnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
 		} else {
 			e.mu.Lock()
 			e.current = text
+			e.currentKind = kindText
 			e.mu.Unlock()
-			if text != "" {
-				e.log.Infof("启动基线：本地 %d 字符", runeCount(text))
-			}
+			e.log.SyncInfof("启动基线：本地 %d 字符", runeCount(text))
 		}
-	} else {
-		e.log.Warnf("读取剪贴板失败：%v", err)
+	default:
+		// 没有文本：剪贴板里可能是图片。同样立成基线，
+		// 免得刚启动就把一张本来就在本机的图当成「新复制的内容」推上去。
+		e.primeImageBaseline(cfg)
 	}
-	if sc, ok := e.clip.(seqClipboard); ok {
-		if seq, ok2 := sc.Seq(); ok2 {
-			e.mu.Lock()
-			e.localSeq, e.seqPrimed = seq, true
-			e.mu.Unlock()
-		}
-	}
-	e.log.Infof("开始同步：%s", e.describeRemote())
+
+	e.markLocalSeq()
+	e.log.SyncInfof("开始同步：%s", e.describeRemote())
 	e.syncCycle(true)
+}
+
+// primeImageBaseline 在启动时把剪贴板里的图片记为基线（没有文本时才会走到这里）。
+func (e *SyncEngine) primeImageBaseline(cfg Config) {
+	if !cfg.SyncImages {
+		return
+	}
+	ic, ok := e.clip.(imageClipboard)
+	if !ok || !ic.HasImage() {
+		return
+	}
+	pngData, err := ic.GetImage()
+	if err != nil || pngData == nil {
+		return
+	}
+	e.mu.Lock()
+	e.current = ""
+	e.currentKind = kindImage
+	e.currentImageHash = hashBytes(pngData)
+	e.currentImageSize = len(pngData)
+	e.mu.Unlock()
+	e.log.SyncInfof("启动基线：本地图片 %s", humanBytes(int64(len(pngData))))
 }
 
 func (e *SyncEngine) describeRemote() string {
@@ -410,19 +461,32 @@ func (e *SyncEngine) checkLocalOnly() {
 }
 
 // checkLocal 检测本地剪贴板变化并推送。
+//
+// 内容优先级是**文本优先**：剪贴板同时有文本和位图时（Excel/Word 复制单元格、
+// 网页复制富文本都会这样）按文本同步。用户复制的「是一段内容」，
+// 把它当图片推过去只会得到一张看不清的截图。只有完全没有文本时才当图片处理。
 func (e *SyncEngine) checkLocal(cfg Config) {
-	local, err := e.readLocalIfChanged()
+	if !e.localChanged() {
+		return
+	}
+	text, err := e.clip.GetText()
 	if err != nil {
 		e.setError(err)
 		return
 	}
-	if local == nil {
+	if text != "" {
+		e.handleLocalText(cfg, text)
 		return
 	}
-	if *local == e.getCurrent() {
+	e.handleLocalImage(cfg)
+}
+
+// handleLocalText 处理「剪贴板里是文本」的情况（长度上限逻辑与图片无关）。
+func (e *SyncEngine) handleLocalText(cfg Config, text string) {
+	if text == e.getCurrent() {
 		return
 	}
-	if n := runeCount(*local); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
+	if n := runeCount(text); cfg.MaxTextChars > 0 && n > cfg.MaxTextChars {
 		// 超长内容**不写进 current**。current 的语义是「本地与远端一致的那份内容」，
 		// 界面上「本地内容」直接显示它，所以把它换成一份从未推送成功的内容会同时造成：
 		//   ① 界面上显示出一段其实没同步过去的内容；
@@ -431,39 +495,118 @@ func (e *SyncEngine) checkLocal(cfg Config) {
 		// 「同一条只告警一次」由下面的 oversizeText 兜底
 		// （正常情况下剪贴板序号没变就不会重复读到）。
 		e.mu.Lock()
-		first := e.oversizeText != *local
-		e.oversizeText = *local
+		first := e.oversizeText != text
+		e.oversizeText = text
 		e.oversize++ // 让界面能告诉用户「有多少次因为太长被跳过了」
 		e.mu.Unlock()
 		if first {
-			e.log.Warnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
+			e.log.SyncWarnf("本地 %d 字符超自动同步上限 %d，未推送", n, cfg.MaxTextChars)
 		}
 		return
 	}
-	e.pushRemote(cfg, *local)
+	e.pushRemote(cfg, text)
 }
 
-// readLocalIfChanged 读取本地剪贴板文本。
-// 返回 nil 表示「自上次读取以来未变化」（Windows 下借助剪贴板序号快速跳过）。
-func (e *SyncEngine) readLocalIfChanged() (*string, error) {
-	if e.hasSeq {
-		if sc, ok := e.clip.(seqClipboard); ok {
-			if seq, ok2 := sc.Seq(); ok2 {
-				e.mu.Lock()
-				unchanged := e.seqPrimed && seq == e.localSeq
-				e.localSeq, e.seqPrimed = seq, true
-				e.mu.Unlock()
-				if unchanged {
-					return nil, nil
-				}
-			}
-		}
+// handleLocalImage 处理「剪贴板里没有文本、但可能有图片」的情况。
+//
+// 没有文本也没有图片时直接返回：不推送空文本。
+// 否则「复制一张图片」会把远端的文本记录覆盖成一条空文本
+// （旧实现就是这么做的，图片同步关掉时尤其明显）。
+func (e *SyncEngine) handleLocalImage(cfg Config) {
+	ic, ok := e.clip.(imageClipboard)
+	if !ok || !ic.HasImage() {
+		return
 	}
-	text, err := e.clip.GetText()
+	if !cfg.SyncImages {
+		// 图片同步关着就静默跳过：这是用户自己在「同步设置」里的选择，
+		// 每复制一张图就记一条「为什么没同步」只会把日志刷满，没有信息量。
+		return
+	}
+	pngData, err := ic.GetImage()
 	if err != nil {
-		return nil, err
+		e.setError(err)
+		return
 	}
-	return &text, nil
+	if pngData == nil {
+		return
+	}
+	hash := hashBytes(pngData)
+	if e.getCurrentKind() == kindImage && e.getCurrentImageHash() == hash {
+		return
+	}
+	if mb := cfg.MaxImageMB; mb > 0 && len(pngData) > mb<<20 {
+		e.mu.Lock()
+		first := e.oversizeImageHash != hash
+		e.oversizeImageHash = hash
+		e.imageOversize++ // 界面上的「图片超限跳过」
+		e.mu.Unlock()
+		if first {
+			e.log.SyncWarnf("本地图片 %s 超自动同步上限 %d MB，未推送",
+				humanBytes(int64(len(pngData))), mb)
+		}
+		return
+	}
+	e.pushImageRemote(cfg, pngData)
+}
+
+// getCurrent 返回「两端已达成一致的内容」（文本）。
+func (e *SyncEngine) getCurrent() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.current
+}
+
+// getCurrentKind 返回「已达成一致的内容」是哪一种（"" / text / image）。
+func (e *SyncEngine) getCurrentKind() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.currentKind
+}
+
+// getCurrentImageHash 返回「已达成一致的图片」的内容哈希。
+func (e *SyncEngine) getCurrentImageHash() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.currentImageHash
+}
+
+// localChanged 报告剪贴板自上次读取以来是否变化。
+// 有廉价序号（Windows）时先用它预判，序号没变就不去读剪贴板内容。
+func (e *SyncEngine) localChanged() bool {
+	if !e.hasSeq {
+		return true
+	}
+	sc, ok := e.clip.(seqClipboard)
+	if !ok {
+		return true
+	}
+	seq, ok := sc.Seq()
+	if !ok {
+		return true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	changed := !e.seqPrimed || seq != e.localSeq
+	e.localSeq, e.seqPrimed = seq, true
+	return changed
+}
+
+// markLocalSeq 把当前剪贴板序号记为「已读」。
+//
+// 自己往剪贴板写完内容后必须调一次：写入会推进序号，不同步的话
+// 下一个本地检查周期会把这次写入当成「用户复制了新内容」而再推回远端（回声）。
+func (e *SyncEngine) markLocalSeq() {
+	sc, ok := e.clip.(seqClipboard)
+	if !ok {
+		return
+	}
+	seq, ok := sc.Seq()
+	if !ok {
+		return
+	}
+	e.mu.Lock()
+	e.localSeq, e.seqPrimed = seq, true
+	e.mu.Unlock()
 }
 
 // pushRemote 把文本推送到远端。
@@ -493,13 +636,80 @@ func (e *SyncEngine) pushRemote(cfg Config, text string) bool {
 		e.lastETag = et
 	}
 	e.current = text
+	e.currentKind = kindText
+	e.currentImageHash = ""
+	e.currentImageSize = 0
 	e.remoteExists = true
 	e.remoteText = text
+	e.remoteKind = kindText
+	e.remoteImageSize = 0
 	e.pushCount++
 	e.lastError, e.lastErrLog = "", ""
 	e.mu.Unlock()
 
-	e.log.Infof("⬆ 推送 （%d 字符）", runeCount(text))
+	e.log.SyncInfof("⬆ 推送 （%d 字符）", runeCount(text))
+	return true
+}
+
+// pushImageRemote 把图片推送到远端：**先 PUT blob、再 PUT JSON**。
+//
+// 顺序不能反。JSON 是索引、blob 是内容：
+//   - 先写 JSON 的话，对端可能在我们上传 blob 之前就拉到 JSON，得到「有元数据、没图」的空条目；
+//   - 中途失败时，远端会留下一个指向不存在 blob 的悬空引用，而它看起来是「一张图」，
+//     对端会反复下载失败。反过来（blob 多余）只是浪费一次存储，无害。
+func (e *SyncEngine) pushImageRemote(cfg Config, pngData []byte) bool {
+	prof := newImageProfile(pngData, cfg.DeviceName)
+	if prof.DataName == nil || *prof.DataName == "" {
+		e.setError(errors.New("内部错误：图片附件名为空"))
+		return false
+	}
+	blobErr := e.client.putBlob(*prof.DataName, pngData)
+
+	e.mu.Lock()
+	e.lastPushAt = time.Now()
+	e.mu.Unlock()
+
+	if blobErr != nil {
+		if errors.Is(blobErr, ErrRateLimited) {
+			e.backoff(pushBackoff, "推送")
+			return false
+		}
+		e.setError(fmt.Errorf("上传图片失败：%w", blobErr))
+		return false
+	}
+
+	payload, err := prof.encode()
+	if err != nil {
+		e.setError(err)
+		return false
+	}
+	hdr, err := e.client.put(payload)
+	if err != nil {
+		if errors.Is(err, ErrRateLimited) {
+			e.backoff(pushBackoff, "推送")
+			return false
+		}
+		e.setError(err)
+		return false
+	}
+
+	e.mu.Lock()
+	if et := cacheETag(hdr); et != "" {
+		e.lastETag = et
+	}
+	e.current = ""
+	e.currentKind = kindImage
+	e.currentImageHash = prof.Hash
+	e.currentImageSize = len(pngData)
+	e.remoteExists = true
+	e.remoteText = ""
+	e.remoteKind = kindImage
+	e.remoteImageSize = len(pngData)
+	e.pushCount++
+	e.lastError, e.lastErrLog = "", ""
+	e.mu.Unlock()
+
+	e.log.SyncInfof("⬆ 推送 （图片 %s）", humanBytes(int64(len(pngData))))
 	return true
 }
 
@@ -537,11 +747,19 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 		wasKnown := e.remoteExists
 		e.remoteExists = false
 		current := e.current
+		kind := e.currentKind
 		e.mu.Unlock()
 		e.clearError()
-		if !wasKnown && current != "" {
-			e.log.Infof("远端无文件，用本地初始化")
-			e.pushRemote(cfg, current)
+		if !wasKnown {
+			switch kind {
+			case kindText:
+				if current != "" {
+					e.log.SyncInfof("远端无文件，用本地初始化")
+					e.pushRemote(cfg, current)
+				}
+			case kindImage:
+				e.seedRemoteWithLocalImage(cfg)
+			}
 		}
 		return
 	}
@@ -567,20 +785,38 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 		return
 	}
 	if plain {
-		e.log.Warnf("远端为纯文本（旧格式），已兼容")
+		e.log.SyncWarnf("远端为纯文本（旧格式），已兼容")
 	}
-	e.noteHash(prof)
 
+	// 先把 ETag 与「远端是什么」记下来，再决定怎么应用。
+	// 顺序有讲究：这样附件下载失败时 ETag 也留得住（失败分支自己会清掉它来触发重试），
+	// 而 304 命中之后就不会每个轮询周期都重下 JSON。
 	e.mu.Lock()
 	if et := cacheETag(hdr); et != "" {
 		e.lastETag = et
 	}
 	e.remoteExists = true
 	e.remoteText = prof.Text
+	if prof.HasData {
+		e.remoteKind = kindImage
+		e.remoteImageSize = prof.Size
+	} else {
+		e.remoteKind = kindText
+		e.remoteImageSize = 0
+	}
 	current := e.current
+	currentKind := e.currentKind
+	currentImageHash := e.currentImageHash
 	e.mu.Unlock()
 
-	if prof.Text == current {
+	// 图片记录：拉附件、写剪贴板
+	if prof.HasData {
+		e.applyRemoteImage(cfg, prof, currentKind, currentImageHash)
+		return
+	}
+
+	e.noteHash(prof)
+	if prof.Text == current && currentKind == kindText {
 		e.clearError()
 		return
 	}
@@ -591,31 +827,117 @@ func (e *SyncEngine) pullRemote(cfg Config, force bool) {
 	}
 	e.mu.Lock()
 	e.current = prof.Text
+	e.currentKind = kindText
+	e.currentImageHash = ""
+	e.currentImageSize = 0
 	e.pullCount++
 	e.lastError, e.lastErrLog = "", ""
-	// 写入剪贴板会改变序号，同步一下避免下个周期把它误判为新变更
-	if sc, ok := e.clip.(seqClipboard); ok {
-		if seq, ok2 := sc.Seq(); ok2 {
-			e.localSeq, e.seqPrimed = seq, true
-		}
-	}
 	e.mu.Unlock()
+	// 写入剪贴板会改变序号，同步一下避免下个周期把它误判为新变更
+	e.markLocalSeq()
 
 	src := derefString(prof.Source)
 	if src != "" {
-		e.log.Infof("⬇ 拉取（%d 字符，来自 %s）", runeCount(prof.Text), src)
+		e.log.SyncInfof("⬇ 拉取（%d 字符，来自 %s）", runeCount(prof.Text), src)
 	} else {
-		e.log.Infof("⬇ 拉取（%d 字符）", runeCount(prof.Text))
+		e.log.SyncInfof("⬇ 拉取（%d 字符）", runeCount(prof.Text))
 	}
+}
+
+// applyRemoteImage 下载远端图片附件并写入本地剪贴板。
+//
+// currentKind / currentImageHash 是调用方在加锁状态下取的「已达成一致」快照，
+// 用来做回声抑制：同一张图不重复写剪贴板。
+func (e *SyncEngine) applyRemoteImage(cfg Config, prof Profile, currentKind, currentImageHash string) {
+	if prof.DataName == nil || *prof.DataName == "" {
+		e.setError(errors.New("远端图片缺少附件名（data_name）"))
+		return
+	}
+	if !cfg.SyncImages {
+		// 图片同步关着：远端是图片就跳过。ETag 已缓存，不会每个轮询周期都重下 JSON。
+		// 同样静默——理由见 handleLocalImage。
+		return
+	}
+	data, err := e.client.getBlob(*prof.DataName)
+	if err != nil {
+		if errors.Is(err, ErrRateLimited) {
+			e.backoff(pullBackoff, "拉取")
+			return
+		}
+		e.setError(fmt.Errorf("下载图片失败：%w", err))
+		// 附件可能还没传上来（对端 push「先 blob 后 JSON」的中间态）：
+		// 清掉 ETag，下一轮重新拉 JSON 再试；否则 304 会让这次失败变成永久跳过
+		e.mu.Lock()
+		e.lastETag = ""
+		e.mu.Unlock()
+		return
+	}
+	if _, err := decodePNG(data); err != nil {
+		e.setError(fmt.Errorf("远端附件不是合法图片：%w", err))
+		e.mu.Lock()
+		e.lastETag = ""
+		e.mu.Unlock()
+		return
+	}
+	// 判重按**下载到的字节**算，不信任远端 hash 字段：对端可能用别的算法，
+	// 直接比它会让同一张图被反复写进剪贴板。
+	hash := hashBytes(data)
+	if currentKind == kindImage && currentImageHash == hash {
+		e.clearError()
+		return
+	}
+	ic, ok := e.clip.(imageClipboard)
+	if !ok {
+		e.log.SyncWarnf("当前平台不支持写入剪贴板图片，已跳过远端图片")
+		return
+	}
+	if err := ic.SetImage(data); err != nil {
+		e.setError(err)
+		return
+	}
+	e.mu.Lock()
+	e.current = ""
+	e.currentKind = kindImage
+	e.currentImageHash = hash
+	e.currentImageSize = len(data)
+	e.pullCount++
+	e.lastError, e.lastErrLog = "", ""
+	e.mu.Unlock()
+	e.markLocalSeq()
+
+	if src := derefString(prof.Source); src != "" {
+		e.log.SyncInfof("⬇ 拉取（图片 %s，来自 %s）", humanBytes(int64(len(data))), src)
+	} else {
+		e.log.SyncInfof("⬇ 拉取（图片 %s）", humanBytes(int64(len(data))))
+	}
+}
+
+// seedRemoteWithLocalImage 远端还没有文件时，用本机剪贴板里的图片初始化远端。
+func (e *SyncEngine) seedRemoteWithLocalImage(cfg Config) {
+	ic, ok := e.clip.(imageClipboard)
+	if !ok || !ic.HasImage() {
+		return
+	}
+	pngData, err := ic.GetImage()
+	if err != nil || pngData == nil {
+		return
+	}
+	if mb := cfg.MaxImageMB; mb > 0 && len(pngData) > mb<<20 {
+		return // 超自动上限的图片不参与初始化（与文本超长不推送一致）
+	}
+	e.log.SyncInfof("远端无文件，用本地图片初始化")
+	e.pushImageRemote(cfg, pngData)
 }
 
 // ---------------------------------------------------------------- 手动操作
 
 // PushNow 立即把当前剪贴板推送到远端。
 //
-// 这是**手动**推送（托盘菜单与界面右上角的「推送」按钮共用它），所以长度上限用
-// ManualMaxTextChars 而不是 MaxTextChars——手动触发是用户的明确意图，允许突破
-// 自动同步的上限。两个上限互不影响：自动同步仍然只看 MaxTextChars。
+// 这是**手动**推送（托盘菜单与界面右上角的「推送」按钮共用它），所以上限用
+// ManualMaxTextChars / ManualMaxImageMB 而不是自动那两个——手动触发是用户的明确意图，
+// 允许突破自动同步的上限。两组上限互不影响：自动同步仍然只看 MaxTextChars / MaxImageMB。
+//
+// 内容优先级与自动同步一致：有文本推文本，没有文本才推图片。
 func (e *SyncEngine) PushNow() error {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
@@ -628,22 +950,53 @@ func (e *SyncEngine) PushNow() error {
 	if err != nil {
 		return err
 	}
-	if text == "" {
-		return errors.New("本地剪贴板没有文本内容")
-	}
-	if n := runeCount(text); cfg.ManualMaxTextChars > 0 && n > cfg.ManualMaxTextChars {
-		return fmt.Errorf("本地 %d 字符超手动推送上限 %d，未推送", n, cfg.ManualMaxTextChars)
-	}
-	if !e.pushRemote(cfg, text) {
-		e.mu.Lock()
-		msg := e.lastError
-		e.mu.Unlock()
-		if msg == "" {
-			msg = "推送失败"
+	if text != "" {
+		if n := runeCount(text); cfg.ManualMaxTextChars > 0 && n > cfg.ManualMaxTextChars {
+			return fmt.Errorf("本地 %d 字符超手动推送上限 %d，未推送", n, cfg.ManualMaxTextChars)
 		}
-		return errors.New(msg)
+		if !e.pushRemote(cfg, text) {
+			return e.lastPushError()
+		}
+		return nil
+	}
+	return e.pushLocalImageNow(cfg)
+}
+
+// pushLocalImageNow 手动推送剪贴板里的图片（没有文本时才会走到）。
+func (e *SyncEngine) pushLocalImageNow(cfg Config) error {
+	ic, ok := e.clip.(imageClipboard)
+	if !ok || !ic.HasImage() {
+		return errors.New("本地剪贴板没有可同步的内容")
+	}
+	if !cfg.SyncImages {
+		return errors.New("本地剪贴板是图片，但图片同步已关闭")
+	}
+	pngData, err := ic.GetImage()
+	if err != nil {
+		return err
+	}
+	if pngData == nil {
+		return errors.New("本地剪贴板没有可同步的内容")
+	}
+	if mb := cfg.ManualMaxImageMB; mb > 0 && len(pngData) > mb<<20 {
+		return fmt.Errorf("本地图片 %s 超手动推送上限 %d MB，未推送",
+			humanBytes(int64(len(pngData))), mb)
+	}
+	if !e.pushImageRemote(cfg, pngData) {
+		return e.lastPushError()
 	}
 	return nil
+}
+
+// lastPushError 取上一次失败的原因（手动推送用它拼返回的错误）。
+func (e *SyncEngine) lastPushError() error {
+	e.mu.Lock()
+	msg := e.lastError
+	e.mu.Unlock()
+	if msg == "" {
+		msg = "推送失败"
+	}
+	return errors.New(msg)
 }
 
 // PullNow 忽略 ETag 缓存，强制从远端拉取一次。
@@ -665,7 +1018,21 @@ func (e *SyncEngine) PullNow() error {
 	return nil
 }
 
-// TestConnection 使用给定配置测试 WebDAV 连通性。
+// TestConnection 使用给定配置测试 WebDAV 连通性，并**把远端目录建好**。
+//
+// 建目录放在这里、而不是每次同步时做，是有意的：
+//   - 这是用户配置连接时唯一会主动触发的动作，做一次就够；
+//   - 同步过程中就不必再「猜服务器用哪个状态码表示父目录不存在」——
+//     403 那次故障正是栽在这个猜测上（有的服务器给 403 而不是标准的 409）。
+//
+// 幂等：目录已存在时 MKCOL 返回 405，被当作成功，所以反复点「测试连接」没有副作用。
 func TestConnection(cfg Config, log *LogBuffer) error {
-	return newWebDAVClient(cfg, log).testConnection()
+	client := newWebDAVClient(cfg, log)
+	if err := client.testConnection(); err != nil {
+		return err
+	}
+	if err := client.ensureRemoteLayout(); err != nil {
+		return fmt.Errorf("已连上服务器，但准备远端目录失败：%w", err)
+	}
+	return nil
 }

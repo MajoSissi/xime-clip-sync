@@ -83,7 +83,7 @@ func testLogOptions(dir string) LogFileOptions {
 	}
 }
 
-// 日志落盘：按天分文件、写入内容正确、关闭后不再写。
+// 日志落盘：按天分文件、**两条通道各写各的文件**、关闭后不再写。
 func TestLogFile(t *testing.T) {
 	dir := t.TempDir()
 	log := NewLogBuffer(10)
@@ -92,44 +92,71 @@ func TestLogFile(t *testing.T) {
 	}
 	log.Infof("hello %s", "world")
 	log.Errorf("出错了：%d", 42)
+	log.SyncInfof("⬆ 推送 （%d 字符）", 5)
 
-	path := log.CurrentFile()
-	if path == "" {
-		t.Fatal("落盘时 CurrentFile 不应为空")
+	today := time.Now().Format(logDateLayout)
+
+	// 程序日志只落在 .app.log 里
+	appPath := log.CurrentFile(LogApp)
+	if appPath == "" {
+		t.Fatal("落盘时 CurrentFile(LogApp) 不应为空")
 	}
-	wantName := logFilePrefix + time.Now().Format(logDateLayout) + logFileSuffix
-	if got := filepath.Base(path); got != wantName {
-		t.Errorf("日志文件名 = %q，期望 %q", got, wantName)
+	if got, want := filepath.Base(appPath), logFileName(LogApp, today); got != want {
+		t.Errorf("程序日志文件名 = %q，期望 %q", got, want)
 	}
-	if got := filepath.Dir(path); got != dir {
+	if got := filepath.Dir(appPath); got != dir {
 		t.Errorf("日志目录 = %q，期望 %q", got, dir)
 	}
-
-	data, err := os.ReadFile(path)
+	appData, err := os.ReadFile(appPath)
 	if err != nil {
-		t.Fatalf("读取日志文件失败：%v", err)
+		t.Fatalf("读取程序日志失败：%v", err)
 	}
-	content := string(data)
 	for _, want := range []string{"hello world", "出错了：42", "error"} {
-		if !strings.Contains(content, want) {
-			t.Errorf("日志文件缺少 %q，实际内容：\n%s", want, content)
+		if !strings.Contains(string(appData), want) {
+			t.Errorf("程序日志缺少 %q，实际内容：\n%s", want, appData)
 		}
+	}
+	if strings.Contains(string(appData), "⬆ 推送") {
+		t.Errorf("同步日志被写进了程序日志：\n%s", appData)
+	}
+
+	// 同步日志只落在 .sync.log 里
+	syncPath := log.CurrentFile(LogSync)
+	if got, want := filepath.Base(syncPath), logFileName(LogSync, today); got != want {
+		t.Errorf("同步日志文件名 = %q，期望 %q", got, want)
+	}
+	syncData, err := os.ReadFile(syncPath)
+	if err != nil {
+		t.Fatalf("读取同步日志失败：%v", err)
+	}
+	if !strings.Contains(string(syncData), "⬆ 推送 （5 字符）") {
+		t.Errorf("同步日志缺少推送记录，实际内容：\n%s", syncData)
+	}
+	if strings.Contains(string(syncData), "hello world") {
+		t.Errorf("程序日志被写进了同步日志：\n%s", syncData)
 	}
 
 	// 关闭落盘后不应再写文件，CurrentFile 也应为空
 	if err := log.SetLogFile(LogFileOptions{RetainDays: 7}); err != nil {
 		t.Fatalf("关闭日志落盘失败：%v", err)
 	}
-	if p := log.CurrentFile(); p != "" {
-		t.Errorf("关闭落盘后 CurrentFile = %q，期望空串", p)
+	for _, kind := range logKinds {
+		if p := log.CurrentFile(kind); p != "" {
+			t.Errorf("关闭落盘后 CurrentFile(%s) = %q，期望空串", kind, p)
+		}
 	}
 	log.Infof("关闭后不应出现")
-	data, _ = os.ReadFile(path)
-	if strings.Contains(string(data), "关闭后不应出现") {
-		t.Error("关闭落盘之后仍在写文件")
+	log.SyncInfof("关闭后也不应出现")
+	appData, _ = os.ReadFile(appPath)
+	if strings.Contains(string(appData), "关闭后不应出现") {
+		t.Error("关闭落盘之后仍在写程序日志")
+	}
+	syncData, _ = os.ReadFile(syncPath)
+	if strings.Contains(string(syncData), "关闭后也不应出现") {
+		t.Error("关闭落盘之后仍在写同步日志")
 	}
 	// 内存日志不受落盘开关影响
-	if len(log.Lines(0)) == 0 {
+	if len(log.Lines(LogApp, 0)) == 0 || len(log.Lines(LogSync, 0)) == 0 {
 		t.Error("关闭落盘后内存日志不应受影响")
 	}
 }
@@ -153,7 +180,7 @@ func TestLogFileSizeCap(t *testing.T) {
 		log.Infof("%s", big)
 	}
 
-	info, err := os.Stat(log.CurrentFile())
+	info, err := os.Stat(log.CurrentFile(LogApp))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,11 +188,11 @@ func TestLogFileSizeCap(t *testing.T) {
 	if info.Size() > cap64k+4096 {
 		t.Errorf("日志未按配置的上限封顶：体积 %d 字节（上限 %d）", info.Size(), cap64k)
 	}
-	data, _ := os.ReadFile(log.CurrentFile())
+	data, _ := os.ReadFile(log.CurrentFile(LogApp))
 	if !strings.Contains(string(data), "64 KB 上限") {
 		t.Errorf("封顶后应留下说明上限的提示，实际内容结尾：\n%s", lastBytes(string(data), 200))
 	}
-	if len(log.Lines(0)) == 0 {
+	if len(log.Lines(LogApp, 0)) == 0 {
 		t.Error("封顶后内存日志不应受影响")
 	}
 }
@@ -186,16 +213,54 @@ func TestLogFileSizeUnlimited(t *testing.T) {
 		log.Infof("%s", big)
 	}
 
-	info, err := os.Stat(log.CurrentFile())
+	info, err := os.Stat(log.CurrentFile(LogApp))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Size() < 300<<10 {
 		t.Errorf("不限制时不应封顶，体积只有 %d 字节", info.Size())
 	}
-	data, _ := os.ReadFile(log.CurrentFile())
+	data, _ := os.ReadFile(log.CurrentFile(LogApp))
 	if strings.Contains(string(data), "上限") {
 		t.Error("不限制时不该出现封顶提示")
+	}
+}
+
+// 单文件上限是**每条通道各自**的：同步日志刷屏不该把程序日志也封顶。
+func TestLogFileCapIsPerChannel(t *testing.T) {
+	dir := t.TempDir()
+	log := NewLogBuffer(10)
+	opt := testLogOptions(dir)
+	opt.MaxFileBytes = 64 << 10
+	if err := log.SetLogFile(opt); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.SetLogFile(LogFileOptions{}) })
+
+	big := strings.Repeat("x", 1024)
+	for i := 0; i < 500; i++ {
+		log.SyncInfof("%s", big) // 把同步日志顶到上限
+	}
+	log.Infof("程序日志还应该写得进去")
+
+	appInfo, err := os.Stat(log.CurrentFile(LogApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appInfo.Size() > 4096 {
+		t.Errorf("同步日志刷屏把程序日志也撑大了：%d 字节", appInfo.Size())
+	}
+	appData, _ := os.ReadFile(log.CurrentFile(LogApp))
+	if !strings.Contains(string(appData), "程序日志还应该写得进去") {
+		t.Errorf("同步日志封顶后程序日志仍应正常写入，实际内容：\n%s", appData)
+	}
+
+	syncInfo, err := os.Stat(log.CurrentFile(LogSync))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if syncInfo.Size() > (64<<10)+4096 {
+		t.Errorf("同步日志未按上限封顶：%d 字节", syncInfo.Size())
 	}
 }
 
@@ -258,7 +323,36 @@ func TestConfigUpgradeKeepsLogFileCap(t *testing.T) {
 	}
 }
 
+// 两条通道的内存环互不挤占：程序日志刷屏不该把同步日志顶出去。
+func TestLogRingsAreIndependent(t *testing.T) {
+	log := NewLogBuffer(5)
+	for i := 0; i < 20; i++ {
+		log.SyncInfof("同步 %d", i)
+	}
+	for i := 0; i < 50; i++ {
+		log.Infof("程序 %d", i)
+	}
+
+	syncLines := log.Lines(LogSync, 0)
+	if len(syncLines) != 5 {
+		t.Fatalf("同步环应保留 5 条，实际 %d 条：%+v", len(syncLines), syncLines)
+	}
+	if syncLines[0].Text != "同步 15" {
+		t.Errorf("同步环里最早的应是「同步 15」，实际 %q", syncLines[0].Text)
+	}
+	appLines := log.Lines(LogApp, 0)
+	if len(appLines) != 5 || appLines[4].Text != "程序 49" {
+		t.Errorf("程序环内容不符：%+v", appLines)
+	}
+
+	byKind := log.LinesByKind(0)
+	if len(byKind[LogSync]) != 5 || len(byKind[LogApp]) != 5 {
+		t.Errorf("LinesByKind 应两条通道都给全：%+v", byKind)
+	}
+}
+
 // 保留期清理：只删过期的日志文件，且不碰名字不匹配的文件。
+// 两条通道的文件按同一个保留期一起清理。
 func TestLogRetention(t *testing.T) {
 	dir := t.TempDir()
 	log := NewLogBuffer(10)
@@ -268,17 +362,19 @@ func TestLogRetention(t *testing.T) {
 	t.Cleanup(func() { log.SetLogFile(LogFileOptions{}) })
 
 	now := time.Now()
-	mk := func(daysAgo int) string {
-		name := logFilePrefix + now.AddDate(0, 0, -daysAgo).Format(logDateLayout) + logFileSuffix
-		p := filepath.Join(dir, name)
+	mk := func(kind LogKind, daysAgo int) string {
+		p := filepath.Join(dir, logFileName(kind, now.AddDate(0, 0, -daysAgo).Format(logDateLayout)))
 		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		return p
 	}
 	// 保留 3 天 = 今天 + 前 2 天
-	keep := []string{mk(0), mk(1), mk(2)}
-	drop := []string{mk(3), mk(10), mk(200)}
+	var keep, drop []string
+	for _, kind := range logKinds {
+		keep = append(keep, mk(kind, 0), mk(kind, 1), mk(kind, 2))
+		drop = append(drop, mk(kind, 3), mk(kind, 10), mk(kind, 200))
+	}
 
 	// 名字不符合规则的文件不应被误删
 	other := filepath.Join(dir, "notes.txt")
@@ -308,32 +404,63 @@ func TestLogRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { log2.SetLogFile(LogFileOptions{}) })
-	ancient := mk(999)
+	ancient := mk(LogApp, 999)
 	log2.Cleanup()
 	if !fileExists(ancient) {
 		t.Error("保留天数为 0 时不应删除任何日志")
 	}
 }
 
-// logFileDate 只负责「剥掉已知前缀、取出日期段」，
+// 旧命名（没有通道段）的日志文件也必须被保留期清理掉，
+// 否则从 v1.5 升级上来的用户会永远留着那些文件。
+func TestLogRetentionCleansLegacyNames(t *testing.T) {
+	dir := t.TempDir()
+	log := NewLogBuffer(10)
+	if err := log.SetLogFile(LogFileOptions{Dir: dir, Enabled: true, RetainDays: 3, MaxFileBytes: defaultMaxLogFileBytes}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { log.SetLogFile(LogFileOptions{}) })
+
+	legacy := filepath.Join(dir, logFilePrefix+
+		time.Now().AddDate(0, 0, -30).Format(logDateLayout)+logFileSuffix)
+	if err := os.WriteFile(legacy, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log.Cleanup()
+
+	if fileExists(legacy) {
+		t.Error("旧命名（无通道段）的过期日志也应被清理")
+	}
+}
+
+// parseLogFileName 只负责「认出这是本程序的日志、剥出通道与日期段」，
 // 日期本身合不合法交给调用方的 ParseInLocation 判断。
-func TestLogFileDate(t *testing.T) {
+func TestParseLogFileName(t *testing.T) {
 	cases := []struct {
 		name string
-		want string
+		kind LogKind
+		date string
 		ok   bool
 	}{
-		{"xime-clip-sync-2026-09-27.log", "2026-09-27", true},
-		{"xime-clip-sync-notes.log", "notes", true}, // 前缀对但日期不合法 → 由调用方挡掉
-		{"xime-clip-sync-.log", "", true},
-		{"notes.txt", "", false},
-		{"xime-clip-sync-2026-09-27.txt", "", false},
-		{"", "", false},
+		{"xime-clip-sync-2026-09-27.sync.log", LogSync, "2026-09-27", true},
+		{"xime-clip-sync-2026-09-27.app.log", LogApp, "2026-09-27", true},
+		// 旧命名（v1.5 之前没有通道段）：按程序日志对待
+		{"xime-clip-sync-2026-09-27.log", LogApp, "2026-09-27", true},
+		// 前缀对但日期不合法 → 由调用方挡掉
+		{"xime-clip-sync-notes.log", LogApp, "notes", true},
+		{"xime-clip-sync-.log", LogApp, "", true},
+		// 通道段不认识 → 不是本程序的文件，不碰
+		{"xime-clip-sync-2026-09-27.bogus.log", "", "", false},
+		{"notes.txt", "", "", false},
+		{"xime-clip-sync-2026-09-27.sync.txt", "", "", false},
+		{"", "", "", false},
 	}
 	for _, c := range cases {
-		got, ok := logFileDate(c.name)
-		if ok != c.ok || got != c.want {
-			t.Errorf("logFileDate(%q) = (%q, %v)，期望 (%q, %v)", c.name, got, ok, c.want, c.ok)
+		got, ok := parseLogFileName(c.name)
+		if ok != c.ok || got.Kind != c.kind || got.Date != c.date {
+			t.Errorf("parseLogFileName(%q) = (%+v, %v)，期望 ({%s %s}, %v)",
+				c.name, got, ok, c.kind, c.date, c.ok)
 		}
 	}
 }
@@ -354,7 +481,7 @@ func TestLogRetentionSkipsFilesWithoutDate(t *testing.T) {
 	mk := func(name string, daysAgo int) string {
 		p := filepath.Join(dir, name)
 		if daysAgo >= 0 {
-			p = filepath.Join(dir, logFilePrefix+now.AddDate(0, 0, -daysAgo).Format(logDateLayout)+logFileSuffix)
+			p = filepath.Join(dir, logFileName(LogSync, now.AddDate(0, 0, -daysAgo).Format(logDateLayout)))
 		}
 		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)

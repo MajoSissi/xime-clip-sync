@@ -745,6 +745,39 @@ func TestUIServerFailedOnlyOnUnexpectedExit(t *testing.T) {
 	}
 }
 
+// 「运行状态」页只展示同步日志，且前端必须按 kind 过滤掉另一条通道。
+//
+// 这两件事都会**静默**失效：面板 id 写错只会让日志永远空着；
+// 少了 kind 过滤则会把程序日志混进同步日志里，界面上看不出任何异常。
+func TestStatusPageShowsOnlySyncLogs(t *testing.T) {
+	html := string(indexHTML)
+
+	for _, bad := range []string{">运行日志<", "<h2>程序日志</h2>", `id="appLogs"`} {
+		if strings.Contains(html, bad) {
+			t.Errorf("「运行状态」页不该再有 %s", bad)
+		}
+	}
+	for _, want := range []string{"<h2>同步日志</h2>", `id="syncLogs"`} {
+		if !strings.Contains(html, want) {
+			t.Errorf("web/index.html 缺少 %s", want)
+		}
+	}
+
+	// 前端只渲染同步通道。期望的写法由 Go 侧常量拼出来：
+	// 改了 LogSync 的值而前端没跟上就会红。
+	if want := `const LOG_KIND = "` + string(LogSync) + `"`; !strings.Contains(html, want) {
+		t.Errorf("web/index.html 里缺少 %q", want)
+	}
+	if !strings.Contains(html, "line.kind !== LOG_KIND") {
+		t.Error("addLog 没有按 kind 过滤，程序日志会混进同步日志面板")
+	}
+
+	// /api/logs 仍然按通道返回，前端只取同步那一份
+	if !strings.Contains(html, "logs.sync") {
+		t.Error("web/index.html 没有从 /api/logs 里取同步通道")
+	}
+}
+
 // 每个配置字段都必须在 web/index.html 的 FIELDS 数组里。
 //
 // 漏一个的后果是**静默**的：readForm 按 FIELDS 取值，漏掉的字段不会提交，
@@ -784,4 +817,3 @@ func TestEveryConfigFieldIsInTheForm(t *testing.T) {
 		}
 	}
 }
-
