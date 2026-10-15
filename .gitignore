@@ -2,7 +2,7 @@
 # config.json / logs/ / xime-clip-sync.ui 也都在这里，一整个目录不入库。
 build/
 .workbuddy/
-
+.workbuddy-ai/
 
 # 构建期生成的 Windows 资源对象（由 genico.go 从 img/logo.ico 生成）。
 # 它必须留在源码根才能被 go build 自动链接，所以单独忽略。
